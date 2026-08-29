@@ -1,20 +1,21 @@
 import argparse
 
-from lib.search_utils import wwid_command
+from search import employee_id_command
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LDAP Search CLI")
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    wwid_parser = subparsers.add_parser("wwid", help="Search for a user by WWID")
-    wwid_parser.add_argument("wwid", type=str, help="Employee WWID")
+    employee_id_parser = subparsers.add_parser("employee", help="Search for a user by Employee ID")
+    employee_id_parser.add_argument("employee_id", type=str, help="Employee ID")
 
     args = parser.parse_args()
 
     match args.command:
-        case "wwid":
-            wwid_command(args.wwid)
+        case "employee":
+            employee_id_command(args.employee_id)
             pass
         case _:
             parser.print_help()
