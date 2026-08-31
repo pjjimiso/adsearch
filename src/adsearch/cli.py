@@ -1,6 +1,6 @@
 import argparse
 
-from search import employee_id_command
+from adsearch.config import LDAPConfig
 
 
 def main() -> None:
@@ -13,6 +13,8 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    config = LDAPConfig.from_env()
+
     match args.command:
         case "employee":
             employee_id_command(args.employee_id)
@@ -20,6 +22,9 @@ def main() -> None:
         case _:
             parser.print_help()
 
+
+def employee_id_command(employee_id: str) -> None:
+    print(f"Searching for Employee ID: {employee_id}")
 
 if __name__ == "__main__":
     main()

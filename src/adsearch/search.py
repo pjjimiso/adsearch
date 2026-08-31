@@ -1,4 +1,4 @@
-from models import User
+from adsearch.models import User
 
 
 class LDAPSearch:
