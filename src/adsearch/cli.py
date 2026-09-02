@@ -1,21 +1,24 @@
 import argparse
 
 from adsearch.config import LDAPConfig
+from adsearch.search import LDAPSearch
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LDAP Search CLI")
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers.add_parser("test", help="Test the LDAP connection")
 
     employee_id_parser = subparsers.add_parser("employee", help="Search for a user by Employee ID")
     employee_id_parser.add_argument("employee_id", type=str, help="Employee ID")
 
     args = parser.parse_args()
 
-    config = LDAPConfig.from_env()
-
     match args.command:
+        case "test": 
+            test_command()
+
         case "employee":
             employee_id_command(args.employee_id)
             pass
@@ -23,8 +26,16 @@ def main() -> None:
             parser.print_help()
 
 
+def test_command() -> None:
+    config = LDAPConfig.from_env()
+    search = LDAPSearch(config)
+    print(f"bound: {search.conn.bound}")
+    print(f"whoami: {search.conn.extend.standard.who_am_i()}")
+
+
 def employee_id_command(employee_id: str) -> None:
     print(f"Searching for Employee ID: {employee_id}")
+
 
 if __name__ == "__main__":
     main()
