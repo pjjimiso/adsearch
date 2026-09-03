@@ -1,15 +1,24 @@
 import ssl
 
-from ldap3 import Connection, Server, Tls, SIMPLE, NONE, AUTO_BIND_NO_TLS
+from ldap3 import Connection, Server, Tls, SIMPLE, NONE, AUTO_BIND_NO_TLS, SUBTREE
+from collections.abc import Sequence
 
 from adsearch.config import LDAPConfig
 from adsearch.models import User
+from adsearch.filters import USER_OBJECT, eq, all_of
+
+
+DEFAULT_USER_ATTRIBUTES = (
+  "distinguishedName", "sAMAccountName", "displayName", "mail",
+  "employeeID", "department", "title", "manager", "userAccountControl",
+)
 
 
 class LDAPSearch:
     def __init__(self, config: LDAPConfig) -> None:
         self._conn: Connection | None = None
         self._config = config
+
 
     @property
     def conn(self) -> Connection:
@@ -45,10 +54,30 @@ class LDAPSearch:
         return self._conn
 
 
-    def find_users(self, employee_id: str) -> list[User] | None:
-        """Look up users by employee ID. Returns a single User object."""
-        # TODO - implement LDAP search logic here
-        pass
+    def _search(self, search_filter: str, attributes: Sequence[str]) -> list[dict]:
+        """Runs a paged subtree search and returns raw entries.
+        A Sequence is returned because DEFAULT_USER_ATTRIBUTES needs to be an immutable tuple"""
+        results = []
+        response = self.conn.extend.standard.paged_search(
+            search_base=self._config.base_dn,
+            search_filter=search_filter,
+            attributes=attributes,
+            search_scope=SUBTREE,
+            paged_size=self._config.page_size,
+            time_limit=self._config.time_limit,
+            generator=True,
+        )
+        for entry in response:
+            # ignore referrals (searchResRef)
+            if entry["type"] == "searchResEntry":
+                results.append(entry)
+        return results
+
+
+    def find_users(self, employee_id: str) -> list[dict]:
+        """Look up users by employee ID. Returns a list of User objects."""
+        search_filter = all_of(USER_OBJECT, eq("employeeID", employee_id))
+        return self._search(search_filter, DEFAULT_USER_ATTRIBUTES)
 
 
     def by_employee_id(self, employee_id: str) -> User | None:

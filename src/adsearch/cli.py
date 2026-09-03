@@ -34,7 +34,13 @@ def test_command() -> None:
 
 
 def employee_id_command(employee_id: str) -> None:
+    config = LDAPConfig.from_env()
+    search = LDAPSearch(config)
     print(f"Searching for Employee ID: {employee_id}")
+    rows = search.find_users(employee_id)
+    for row in rows:
+        print(row)
+
 
 
 if __name__ == "__main__":
