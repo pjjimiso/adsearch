@@ -17,3 +17,8 @@ class LDAPConnectionError(LDAPSearchError):
     """Raised for network-level failures: DNS resolution, TCP connect,
     TLS handshake, or a timeout reaching the server."""
 
+
+class LDAPQueryError(LDAPSearchError):
+    """ Raised when the LDAP server rejects a query (malformed filter, 
+    invalid DN, etc.)"""
+
