@@ -1,23 +1,20 @@
 import ssl
 
-from ldap3 import Connection, Server, Tls, SIMPLE, NONE, AUTO_BIND_NO_TLS, SUBTREE
+from ldap3 import SIMPLE, NONE, AUTO_BIND_NO_TLS, SUBTREE, Connection, Server, Tls
 from collections.abc import Sequence
 
 from adsearch.config import LDAPConfig
-from adsearch.models import User
+from adsearch.models import DEFAULT_ATTRIBUTES, AttributeMap, User, to_user
 from adsearch.filters import USER_OBJECT, eq, all_of
 
 
-DEFAULT_USER_ATTRIBUTES = (
-  "distinguishedName", "sAMAccountName", "displayName", "mail",
-  "employeeID", "department", "title", "manager", "userAccountControl",
-)
 
 
 class LDAPSearch:
-    def __init__(self, config: LDAPConfig) -> None:
+    def __init__(self, config: LDAPConfig, attrs: AttributeMap = DEFAULT_ATTRIBUTES) -> None:
         self._conn: Connection | None = None
         self._config = config
+        self._attrs = attrs
 
 
     @property
@@ -55,8 +52,7 @@ class LDAPSearch:
 
 
     def _search(self, search_filter: str, attributes: Sequence[str]) -> list[dict]:
-        """Runs a paged subtree search and returns raw entries.
-        A Sequence is returned because DEFAULT_USER_ATTRIBUTES needs to be an immutable tuple"""
+        """Runs a paged subtree search and returns raw entries."""
         results = []
         response = self.conn.extend.standard.paged_search(
             search_base=self._config.base_dn,
@@ -74,14 +70,18 @@ class LDAPSearch:
         return results
 
 
-    def find_users(self, employee_id: str) -> list[dict]:
+    def find_users(self, employee_id: str) -> list[User]:
         """Look up users by employee ID. Returns a list of User objects."""
-        search_filter = all_of(USER_OBJECT, eq("employeeID", employee_id))
-        return self._search(search_filter, DEFAULT_USER_ATTRIBUTES)
+        search_filter = all_of(USER_OBJECT, eq(self._attrs.employee_id, employee_id))
+        entries = self._search(search_filter, self._attrs.fetch_attributes())
+        users = []
+        for entry in entries:
+            users.append(to_user(entry, self._attrs))
+        return users
 
 
-    def by_employee_id(self, employee_id: str) -> User | None:
-        """Look up a single user by employee ID. Returns None if not found"""
-        users = self.find_users(employee_id)
-        return users[0] if users else None
+#   We'll re-implement this later after building out find_users more
+#    def by_employee_id(self, employee_id: str) -> list[User]:
+#        """Look up a list of users by employee ID""
+#        return self.find_users(employee_id)
 

@@ -1,6 +1,7 @@
 import unittest
 
 from adsearch.config import LDAPConfig
+from adsearch.models import AttributeMap
 from adsearch.errors import LDAPConfigError, LDAPQueryError
 from adsearch.filters import esc, is_valid_attr, eq, all_of, USER_OBJECT
 
@@ -48,6 +49,16 @@ class TestFilters(unittest.TestCase):
             all_of(None)
         with self.assertRaises(LDAPQueryError):
             all_of(None, None)
+
+
+class TestAttributeMap(unittest.TestCase):
+    def test_fetch_attributes(self):
+        main_attrs = ['displayName', 'cn', 'employeeID', 'sAMAccountName', 'mail', 'manager']
+        self.assertEqual(AttributeMap().fetch_attributes(), main_attrs)
+        self.assertEqual(AttributeMap(extra=('mail',)).fetch_attributes(), main_attrs)
+        self.assertEqual(AttributeMap(extra=('customfield',)).fetch_attributes(), main_attrs + ['customfield'])
+
+
 
 if __name__ == "__main__":
     unittest.main()

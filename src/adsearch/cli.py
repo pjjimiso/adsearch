@@ -1,7 +1,10 @@
 import argparse
+import json
 
 from adsearch.config import LDAPConfig
 from adsearch.search import LDAPSearch
+
+
 
 
 def main() -> None:
@@ -37,9 +40,13 @@ def employee_id_command(employee_id: str) -> None:
     config = LDAPConfig.from_env()
     search = LDAPSearch(config)
     print(f"Searching for Employee ID: {employee_id}")
-    rows = search.find_users(employee_id)
-    for row in rows:
-        print(row)
+    print(
+        json.dumps(
+            search.find_users(employee_id='11510745'), 
+            indent=2
+        )
+    )
+
 
 
 
