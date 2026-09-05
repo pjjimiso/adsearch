@@ -1,13 +1,20 @@
 import ssl
 
-from ldap3 import SIMPLE, NONE, AUTO_BIND_NO_TLS, SUBTREE, Connection, Server, Tls
 from collections.abc import Sequence
+
+from ldap3 import (
+    SIMPLE, 
+    NONE,
+    AUTO_BIND_NO_TLS,
+    SUBTREE,
+    Connection,
+    Server,
+    Tls
+)
 
 from adsearch.config import LDAPConfig
 from adsearch.models import DEFAULT_ATTRIBUTES, AttributeMap, User, to_user
 from adsearch.filters import USER_OBJECT, eq, all_of
-
-
 
 
 class LDAPSearch:
@@ -15,7 +22,6 @@ class LDAPSearch:
         self._conn: Connection | None = None
         self._config = config
         self._attrs = attrs
-
 
     @property
     def conn(self) -> Connection:
@@ -50,7 +56,6 @@ class LDAPSearch:
             self._conn = connection
         return self._conn
 
-
     def _search(self, search_filter: str, attributes: Sequence[str]) -> list[dict]:
         """Runs a paged subtree search and returns raw entries."""
         results = []
@@ -68,7 +73,6 @@ class LDAPSearch:
             if entry["type"] == "searchResEntry":
                 results.append(entry)
         return results
-
 
     def find_users(self, employee_id: str) -> list[User]:
         """Look up users by employee ID. Returns a list of User objects."""

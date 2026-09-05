@@ -3,7 +3,15 @@ import unittest
 from adsearch.config import LDAPConfig
 from adsearch.models import AttributeMap
 from adsearch.errors import LDAPConfigError, LDAPQueryError
-from adsearch.filters import esc, is_valid_attr, eq, all_of, USER_OBJECT
+from adsearch.filters import (
+    USER_OBJECT,
+    IN_CHAIN,
+    esc,
+    is_valid_attr,
+    eq,
+    all_of,
+    valid_dn
+)
 
 
 class TestLDAPConfig(unittest.TestCase):
@@ -57,6 +65,22 @@ class TestAttributeMap(unittest.TestCase):
         self.assertEqual(AttributeMap().fetch_attributes(), main_attrs)
         self.assertEqual(AttributeMap(extra=('mail',)).fetch_attributes(), main_attrs)
         self.assertEqual(AttributeMap(extra=('customfield',)).fetch_attributes(), main_attrs + ['customfield'])
+
+
+class TestDNValidation(unittest.TestCase):
+    def test_valid_dn(self):
+        self.assertTrue(valid_dn('CN=John Doe,OU=Users,DC=example,DC=com'))
+        self.assertTrue(valid_dn('CN=Jane Smith,OU=Employees,DC=company,DC=org'))
+
+    def test_invalid_empty_dn(self):
+        with self.assertRaises(LDAPQueryError):
+            valid_dn('')
+
+    def test_invalid_dn(self):
+        with self.assertRaises(LDAPQueryError):
+            valid_dn('not a dn')
+        with self.assertRaises(LDAPQueryError):
+            valid_dn('CN=x)(objectClass=*')
 
 
 
