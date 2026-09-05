@@ -49,7 +49,6 @@ def _first(values: object) -> str | None:
 
 def to_user(entry: dict, attrs: AttributeMap) -> User:
     """Build a User from one raw ldap3 searchResEntry."""
-
     return User(
         dn = entry['dn'],
         name = _first(entry['attributes'].get(attrs.name)) 

@@ -36,16 +36,13 @@ def test_command() -> None:
     print(f"whoami: {search.conn.extend.standard.who_am_i()}")
 
 
-def employee_id_command(employee_id: str) -> None:
+def employee_id_command(id: str) -> None:
     config = LDAPConfig.from_env()
     search = LDAPSearch(config)
-    print(f"Searching for Employee ID: {employee_id}")
-    print(
-        json.dumps(
-            search.find_users(employee_id='11510745'), 
-            indent=2
-        )
-    )
+    print(f"Searching for Employee ID: {id}")
+    results = search.find_users(employee_id=id)
+    print(len(results), 'user(s)')
+    print(json.dumps(results, indent=2))
 
 
 
