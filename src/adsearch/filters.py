@@ -30,18 +30,31 @@ def eq(attribute: str, value: str) -> str:
 
 
 def all_of(*clauses: str | None) -> str:
-    """Returns an AND filter for the given clauses, ignoring None values."""
-    clauses = [c for c in clauses if c is not None]
-    if not clauses:
+    """Returns an AND filter translated into (&...) for the given clauses, 
+    skipping None values. Raises LDAPQueryError if no clauses are provided,
+    empty (&) is not a valid filter"""
+    valid_clauses = [c for c in clauses if c is not None]
+    if not valid_clauses:
         raise LDAPQueryError("Invalid AND filter: no clauses provided")
-    if len(clauses) == 1:
-        return clauses[0]
-    return f"(&{''.join(clauses)})"
+    if len(valid_clauses) == 1:
+        return valid_clauses[0]
+    return f"(&{''.join(valid_clauses)})"
+
+
+def any_of(*clauses: str | None) -> str: 
+    """Returns an OR filter translated into (|...) for the given clauses, 
+    skipping None values. Raises LDAPQueryError if no clauses are provided, 
+    empty (|) is not valid"""
+    valid_clauses = [c for c in clauses if c is not None]
+    if not valid_clauses:
+        raise LDAPQueryError("Invalid OR filter: no clauses provided")
+    if len(valid_clauses) == 1:
+        return valid_clauses[0]
+    return f"(|{''.join(valid_clauses)})"
 
 
 def valid_dn(dn: str) -> str:
-    """Return dn unchanged if it parses as a DN; raise LDAPQueryError if not.
-    Wraps ldap3's parse_dn."""
+    """Return dn unchanged if it parses as a DN; raise LDAPQueryError if not."""
     try:
         parse_dn(dn)
     except LDAPInvalidDnError as e:
@@ -51,12 +64,12 @@ def valid_dn(dn: str) -> str:
 
 def eq_dn(attribute: str, dn: str) -> str:
     """(attribute=dn) - the DN validated, then escaped as a filter value."""
-    # TODO
-    return ""
+    return eq(attribute, valid_dn(dn))
 
 
 def in_chain(attribute: str, dn: str) -> str:
     """(attribute:1.2.840.113556.1.4.1941:=dn) - transitive match down the chain."""
-    # TODO
-    return ""
+    if not is_valid_attr(attribute):
+        raise LDAPQueryError(f"Invalid attribute name: {attribute}")
+    return f"({attribute}:{IN_CHAIN}:={esc(valid_dn(dn))})"
 

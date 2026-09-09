@@ -1,4 +1,5 @@
 import ssl
+import time
 
 from collections.abc import Sequence
 
@@ -7,6 +8,7 @@ from ldap3 import (
     NONE,
     AUTO_BIND_NO_TLS,
     SUBTREE,
+    NO_ATTRIBUTES,
     Connection,
     Server,
     Tls
@@ -14,7 +16,16 @@ from ldap3 import (
 
 from adsearch.config import LDAPConfig
 from adsearch.models import DEFAULT_ATTRIBUTES, AttributeMap, User, to_user
-from adsearch.filters import USER_OBJECT, eq, all_of
+from adsearch.errors import NotFoundError
+from adsearch.filters import (
+    USER_OBJECT, 
+    eq, 
+    all_of,
+    any_of,
+    eq_dn,
+    in_chain,
+)
+
 
 
 class LDAPSearch:
@@ -22,6 +33,7 @@ class LDAPSearch:
         self._conn: Connection | None = None
         self._config = config
         self._attrs = attrs
+
 
     @property
     def conn(self) -> Connection:
@@ -56,6 +68,7 @@ class LDAPSearch:
             self._conn = connection
         return self._conn
 
+
     def _search(self, search_filter: str, attributes: Sequence[str]) -> list[dict]:
         """Runs a paged subtree search and returns raw entries."""
         results = []
@@ -74,9 +87,8 @@ class LDAPSearch:
                 results.append(entry)
         return results
 
-    def find_users(self, employee_id: str) -> list[User]:
-        """Look up users by employee ID. Returns a list of User objects."""
-        search_filter = all_of(USER_OBJECT, eq(self._attrs.employee_id, employee_id))
+
+    def _search_users(self, search_filter: str) -> list[User]:
         entries = self._search(search_filter, self._attrs.fetch_attributes())
         users = []
         for entry in entries:
@@ -84,8 +96,69 @@ class LDAPSearch:
         return users
 
 
+    def find_users(self, employee_id: str) -> list[User]:
+        """Look up users by employee ID. Returns a list of User objects."""
+        search_filter = all_of(USER_OBJECT, eq(self._attrs.employee_id, employee_id))
+        return self._search_users(search_filter)
+
+
+    def resolve_user_dn(self, value: str, *, by: str | None = None) -> str: 
+        """DN of the single user whose `by` attribute equals `value`.
+        `by` defaults to the AttributeMap's username attribute (sAMAccountName).
+        Raises NotFoundError on no match and on multiple matches."""
+        attribute = self._attrs.username if by is None else by
+        search_filter = all_of(USER_OBJECT, eq(attribute, value))
+        entries = self._search(search_filter, [NO_ATTRIBUTES])
+        count = len(entries)
+        if count == 0:
+            raise NotFoundError(f"No user found with {attribute}={value}")
+        if count > 1: 
+            raise NotFoundError(f"Found {count} with {attribute}={value}: {[e["dn"] for e in entries]}")
+        return entries[0]["dn"]
+
+
+    def find_reports_in_chain(self, dn: str, *, recursive: bool = False) -> list[User]:
+        attr_clause = in_chain(self._attrs.manager, dn) if recursive else eq_dn(self._attrs.manager, dn)
+        search_filter = all_of(USER_OBJECT, attr_clause)
+        print(f"DEBUG: search_filter={search_filter}")
+        return self._search_users(search_filter)
+
+
+    def find_reports(self, dn: str, *, recursive: bool = False) -> list[User]:
+        if recursive is False: 
+            print(f"DEBUG: running non-recursive search on {dn}")
+            return self._search_users(all_of(USER_OBJECT, eq_dn(self._attrs.manager, dn)))
+
+        reports = self._search_users(all_of(USER_OBJECT, eq_dn(self._attrs.manager, dn)))
+        all_reports = reports.copy()
+
+        seen = {dn}
+        current_level = [r["dn"] for r in reports]
+        seen.update(current_level)
+
+        while current_level:
+            clauses  = [eq_dn(self._attrs.manager, dn) for dn in current_level]
+            found    = self._search_users(all_of(USER_OBJECT, any_of(*clauses)))
+            new      = [r for r in found if r["dn"] not in seen]
+            seen.update(r["dn"] for r in new)
+            all_reports.extend(new)
+            current_level = [r["dn"] for r in new]
+
+        return all_reports
+
+
+    def by_manager(self, username: str, *, recursive: bool = False) -> list[User]:
+        dn = self.resolve_user_dn(username)
+        return self.find_reports(dn, recursive=recursive)
+
+
+    def by_manager_in_chain(self, username: str, *, recursive: bool = False) -> list[User]:
+        dn = self.resolve_user_dn(username)
+        return self.find_reports_in_chain(dn, recursive=recursive)
+
+
 #   We'll re-implement this later after building out find_users more
-#    def by_employee_id(self, employee_id: str) -> list[User]:
+#    def by_employee_id(self, employee_id: str) -> list[Userg:
 #        """Look up a list of users by employee ID""
 #        return self.find_users(employee_id)
 

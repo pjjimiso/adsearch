@@ -22,3 +22,7 @@ class LDAPQueryError(LDAPSearchError):
     """ Raised when the LDAP server rejects a query (malformed filter, 
     invalid DN, etc.)"""
 
+
+class NotFoundError(LDAPSearchError):
+    """Raised when a required resolve returns 0 — or 2 or more — entries.
+    Distinct from an empty search result, which is a valid answer."""

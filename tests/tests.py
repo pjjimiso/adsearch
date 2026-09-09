@@ -10,7 +10,10 @@ from adsearch.filters import (
     is_valid_attr,
     eq,
     all_of,
-    valid_dn
+    any_of,
+    valid_dn,
+    eq_dn,
+    in_chain,
 )
 
 
@@ -58,6 +61,15 @@ class TestFilters(unittest.TestCase):
         with self.assertRaises(LDAPQueryError):
             all_of(None, None)
 
+    def test_any_of_filter(self): 
+        self.assertEqual(any_of(eq('cn', 'Billy Bob'), eq('sn', 'Smith')), '(|(cn=Billy Bob)(sn=Smith))')
+        self.assertEqual(any_of(eq('cn', 'Billy Bob'), None), '(cn=Billy Bob)')
+        self.assertEqual(any_of(USER_OBJECT, eq('empID', '123')), '(|(&(objectCategory=person)(objectClass=user))(empID=123))')
+        with self.assertRaises(LDAPQueryError):
+            any_of(None)
+        with self.assertRaises(LDAPQueryError):
+            any_of(None, None)
+
 
 class TestAttributeMap(unittest.TestCase):
     def test_fetch_attributes(self):
@@ -81,6 +93,18 @@ class TestDNValidation(unittest.TestCase):
             valid_dn('not a dn')
         with self.assertRaises(LDAPQueryError):
             valid_dn('CN=x)(objectClass=*')
+
+    def test_eq_dn(self):
+        manager = eq_dn('manager', valid_dn('CN=John Doe,OU=Users,DC=example,DC=com'))
+        self.assertEqual(manager, '(manager=CN=John Doe,OU=Users,DC=example,DC=com)')
+
+    def test_in_chain(self):
+        chain_filter = in_chain('manager', 'CN=John Doe,OU=Users,DC=example,DC=com')
+        self.assertEqual(chain_filter, f'(manager:{IN_CHAIN}:=CN=John Doe,OU=Users,DC=example,DC=com)')
+
+    def test_in_chain_invalid_attr(self):
+        with self.assertRaises(LDAPQueryError):
+            in_chain('invalid*', "DC=com")
 
 
 
