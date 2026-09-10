@@ -47,6 +47,8 @@ def main() -> None:
         case "manager":
             results = manager_command(args.username, recursive=args.recursive)
             print(format_users(results, args.fmt))
+            print()
+            print(len(results), 'report(s) found')
             pass
 
         case _:
@@ -63,24 +65,57 @@ def test_command() -> None:
 def employee_id_command(id: str) -> list[User]:
     config = LDAPConfig.from_env()
     search = LDAPSearch(config)
-    print(f"Searching for Employee ID: {id}")
     return search.find_users(employee_id=id)
-    #print(len(results), 'user(s)')
-    #print(json.dumps(results, indent=2))
 
 
 def manager_command(username: str, recursive: bool = False) -> list[User]:
     config = LDAPConfig.from_env()
     search = LDAPSearch(config)
-    if recursive:
-        print(f"Searching the entire reporting tree for manager with username: {username}")
-    else:
-        print(f"Searching for direct reports of manager with username: {username}")
     return search.by_manager(username, recursive=recursive)
 
 
 _COLUMNS = ("username", "dn", "name", "employee_id", "email")
-_TABLE_COLUMNS = ("username", "name", "employee_id", "email")
+_TABLE_COLUMNS = ("username", "name", "employee_id", "email") # Exclude dn for readability
+
+def populate_rows(users: list[User]) -> list[list[str]]: 
+    rows = []
+    rows.append(_TABLE_COLUMNS)
+    for user in users:
+        row = []
+        for col in _TABLE_COLUMNS:
+            value = user[col]
+            if value is None: 
+                value = ''
+            row.append(value)
+        rows.append(row)
+    return rows
+
+
+def define_column_widths(rows: list[list[str]]) -> list[int]:
+    widths = []
+    for i in range(len(rows[0])):
+        longest = 0
+        for row in rows:
+            if len(row[i]) > longest: 
+                longest = len(row[i])
+        widths.append(longest)
+    return widths
+
+
+def build_table(rows: list[list[str]], widths: list[int]) -> str:
+    lines = []
+    for row_index, row in enumerate(rows):
+        cells = []
+        for i in range(len(row)):
+            cells.append(row[i].ljust(widths[i]))
+        lines.append("  ".join(cells).rstrip())
+
+        if row_index == 0:
+            dashes = []
+            for w in widths:
+                dashes.append("-" * w)
+            lines.append("  ".join(dashes))
+    return "\n".join(lines)
 
 
 def format_users(users: list[User], fmt: str) -> str: 
@@ -97,39 +132,9 @@ def format_users(users: list[User], fmt: str) -> str:
             return json.dumps(users, indent=2)
 
         case "table": 
-            rows = []
-            rows.append(_TABLE_COLUMNS)
-            for user in users:
-                row = []
-                for col in _TABLE_COLUMNS:
-                    value = user[col]
-                    if value is None: 
-                        value = ''
-                    row.append(value)
-                rows.append(row)
-
-            widths = []
-            for i in range(len(rows[0])):
-                longest = 0
-                for row in rows:
-                    if len(row[i]) > longest: 
-                        longest = len(row[i])
-                widths.append(longest)
-
-            lines = []
-            for row_index, row in enumerate(rows):
-                cells = []
-                for i in range(len(row)):
-                    cells.append(row[i].ljust(widths[i]))
-                lines.append("  ".join(cells).rstrip())
-
-                if row_index == 0:
-                    dashes = []
-                    for w in widths:
-                        dashes.append("-" * w)
-                    lines.append("  ".join(dashes))
-
-            return "\n".join(lines)
+            rows = populate_rows(users)
+            widths = define_column_widths(rows)
+            return build_table(rows, widths)
 
         case _:
             raise ValueError(f"Unknown format: {fmt}")

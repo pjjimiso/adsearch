@@ -1,7 +1,8 @@
 import ssl
-import time
 
 from collections.abc import Sequence
+from itertools import batched
+from dataclasses import replace
 
 from ldap3 import (
     SIMPLE, 
@@ -118,14 +119,19 @@ class LDAPSearch:
 
 
     def find_reports_in_chain(self, dn: str, *, recursive: bool = False) -> list[User]:
+        """Returns a list of users in the manager's reporting tree using Active Directory's 
+        LDAP_MATCHING_RULE_IN_CHAIN OID"""
         attr_clause = in_chain(self._attrs.manager, dn) if recursive else eq_dn(self._attrs.manager, dn)
         search_filter = all_of(USER_OBJECT, attr_clause)
         return self._search_users(search_filter)
 
 
-    def find_reports(self, dn: str, *, recursive: bool = False) -> list[User]:
-        reports = self._search_users(all_of(USER_OBJECT, eq_dn(self._attrs.manager, dn)))
 
+
+    def find_reports(self, dn: str, *, recursive: bool = False) -> list[User]:
+        """Find all users who reports to the given manager. Non-recursive returns
+        direct reports only, while recursive returns the entire reporting tree"""
+        reports = self._search_users(all_of(USER_OBJECT, eq_dn(self._attrs.manager, dn)))
         if recursive is False: 
             return reports
 
@@ -134,23 +140,34 @@ class LDAPSearch:
         current_level = [r["dn"] for r in reports]
         seen.update(current_level)
 
+        i = 0
         while current_level:
-            clauses  = [eq_dn(self._attrs.manager, dn) for dn in current_level]
-            found    = self._search_users(all_of(USER_OBJECT, any_of(*clauses)))
-            new      = [r for r in found if r["dn"] not in seen]
+            print(f"DEBUG: Level {i}: found {len(current_level)} reports...")
+            found = []
+            for batch in batched(current_level, self._config.batch_size):
+                print("\tDEBUG: querying next batch of 100 reports...")
+                clauses  = [eq_dn(self._attrs.manager, dn) for dn in batch]
+                found.extend(self._search_users(all_of(USER_OBJECT, any_of(*clauses))))
+                print("\tDEBUG: batch finished.")
+            new = [r for r in found if r["dn"] not in seen]
             seen.update(r["dn"] for r in new)
             all_reports.extend(new)
             current_level = [r["dn"] for r in new]
+            i += 1
 
         return all_reports
 
 
     def by_manager(self, username: str, *, recursive: bool = False) -> list[User]:
+        """A wrapper around find_reports that returns a list of users reporting to
+        the specified manager by manager's username."""
         dn = self.resolve_user_dn(username)
         return self.find_reports(dn, recursive=recursive)
 
 
     def by_manager_in_chain(self, username: str, *, recursive: bool = False) -> list[User]:
+        """A wrapper around find_reports_in_chain that returns a list of users reporting to
+        the specified manager using LDAP_MATCHING_RULE_IN_CHAIN."""
         dn = self.resolve_user_dn(username)
         return self.find_reports_in_chain(dn, recursive=recursive)
 

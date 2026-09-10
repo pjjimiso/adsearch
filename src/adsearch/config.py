@@ -24,6 +24,7 @@ class LDAPConfig:
     receive_timeout: int = 60
     time_limit: int = 120
     page_size: int = 1000
+    batch_size: int = 500
 
 
     def __post_init__(self) -> None:
