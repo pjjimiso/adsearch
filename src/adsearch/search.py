@@ -120,18 +120,16 @@ class LDAPSearch:
     def find_reports_in_chain(self, dn: str, *, recursive: bool = False) -> list[User]:
         attr_clause = in_chain(self._attrs.manager, dn) if recursive else eq_dn(self._attrs.manager, dn)
         search_filter = all_of(USER_OBJECT, attr_clause)
-        print(f"DEBUG: search_filter={search_filter}")
         return self._search_users(search_filter)
 
 
     def find_reports(self, dn: str, *, recursive: bool = False) -> list[User]:
-        if recursive is False: 
-            print(f"DEBUG: running non-recursive search on {dn}")
-            return self._search_users(all_of(USER_OBJECT, eq_dn(self._attrs.manager, dn)))
-
         reports = self._search_users(all_of(USER_OBJECT, eq_dn(self._attrs.manager, dn)))
-        all_reports = reports.copy()
 
+        if recursive is False: 
+            return reports
+
+        all_reports = reports.copy()
         seen = {dn}
         current_level = [r["dn"] for r in reports]
         seen.update(current_level)
