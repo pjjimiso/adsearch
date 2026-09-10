@@ -80,12 +80,13 @@ def manager_command(username: str, recursive: bool = False) -> list[User]:
 
 
 _COLUMNS = ("username", "dn", "name", "employee_id", "email")
+_TABLE_COLUMNS = ("username", "name", "employee_id", "email")
 
 
 def format_users(users: list[User], fmt: str) -> str: 
-    buffer = io.StringIO()
     match fmt:
         case "csv":
+            buffer = io.StringIO()
             writer = csv.writer(buffer, lineterminator='\n')
             writer.writerow(_COLUMNS)
             for user in users:
@@ -97,11 +98,10 @@ def format_users(users: list[User], fmt: str) -> str:
 
         case "table": 
             rows = []
-            columns = ["username", "name", "employee_id", "email"]
-            rows.append(columns)
+            rows.append(_TABLE_COLUMNS)
             for user in users:
                 row = []
-                for col in columns:
+                for col in _TABLE_COLUMNS:
                     value = user[col]
                     if value is None: 
                         value = ''
