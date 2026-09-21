@@ -18,7 +18,8 @@ A generic Python library for querying Active Directory over LDAP.
 | Question | Entry point |
 |---|---|
 | Who is this employee ID? | `by_employee_id` |
-| Who reports to this manager (by username)? | `by_manager` |
+| Who are this manager's direct reports (by username)? | `direct_reports` |
+| Who is in this manager's reporting tree (by username)? | `reporting_tree` |
 | Who is in this cost center? | `by_cost_center` |
 | Who is in this group? | `by_group` |
 | Who has this attribute value? | `by_attribute` |
@@ -74,7 +75,7 @@ containing every attribute that was requested. A consumer adds its site-specific
 `AttributeMap.extra`, reads it back out of `attributes`, and classifies there. The library never needs
 to know what a blue badge is.
 
-Callers who prefer local vocabulary alias at their own boundary (`get_reports = ad.by_manager`),
+Callers who prefer local vocabulary alias at their own boundary (`get_reports = ad.direct_reports`),
 which keeps site jargon in the site's repository.
 
 The library also does not do: retry with backoff (fail fast — retry policy is the caller's decision),
@@ -213,7 +214,7 @@ widen the compatibility surface for a rare case. `search.translated()`, `build_s
 
 ```python
 with LDAPSearch(LDAPConfig.from_env(), attrs=MY_SCHEMA) as ad:
-    reports = ad.by_manager("jdoe")
+    reports = ad.direct_reports("jdoe")
 ```
 
 `with` is the supported form and is documented as such. A library that leaves sockets open until
@@ -254,6 +255,7 @@ produces bugs that cannot be reproduced; slotted because it turns field-name typ
 | `receive_timeout` | `int` | `60` | Per-response read; stops a wedged process |
 | `time_limit` | `int` | `120` | Server-side, matching AD's `MaxQueryDuration` |
 | `page_size` | `int` | `1000` | Matching AD's `MaxPageSize` |
+| `batch_size` | `int` | `500` | Manager DNs per OR filter in one reporting-tree level (§8.7) |
 
 `from_env(env: Mapping[str, str] | None = None)` builds a config from `ADSEARCH_*` variables and raises
 `LDAPConfigError` when `server` or `base_dn` is absent. **`env` is a parameter rather than a direct
@@ -391,6 +393,12 @@ that did arrive — an incomplete answer wearing the shape of a complete one (§
 `cli.py`'s `test` subcommand issues `who_am_i()` straight at the connection, past both handlers, and
 wraps that call in `translated()` itself. It is the one command whose entire job is to surface a bad
 bind, so it is the last place a raw `ldap3` exception should appear.
+
+**`close()` is deliberately outside it.** Teardown is the one path where translating would do harm:
+§8.1 requires `close()` to *swallow* a failed unbind, because an exception raised from `__exit__`
+replaces whatever was already propagating out of the `with` block. A translated teardown error is
+still an escaping teardown error, so `close()` keeps its own `except` and is the only public operation
+the no-escape sweep excludes.
 
 ### 6.3 Empty results are not errors
 
@@ -544,8 +552,9 @@ its credentials and retries gets a fresh attempt rather than a permanent failure
 The connection is **lazy**, created and bound on first access to the `conn` property. This keeps
 construction, argument validation, and the entire offline test suite off the network.
 
-There is **one bind per instance**. `by_manager` performs a resolve followed by a search — two
-searches over one connection. Rebinding per method would double the latency of every call.
+There is **one bind per instance**. `direct_reports` performs a resolve followed by a search — two
+searches over one connection, and `reporting_tree` performs a resolve followed by many. Rebinding
+per method would double the latency of every call.
 
 `close()` unbinds if connected, is safe to call repeatedly, and swallows teardown errors: an exception
 raised from `__exit__` replaces the exception already propagating, hiding the real failure.
@@ -630,8 +639,10 @@ audit finding.
 
 Three of the four primary criteria are **not single-filter operations** — manager and group both
 require resolving a DN first. That logic must live somewhere, and a named wrapper is the honest place
-for it. `by_attribute` covers the residual case without inventing a query DSL: any site-specific
-attribute a consumer cares about is reachable without a library change.
+for it. Manager is the one criterion with two wrappers rather than one, for the reason in §8.7, and
+both take a username so that no caller resolves a manager DN itself. `by_attribute` covers the
+residual case without inventing a query DSL: any site-specific attribute a consumer cares about is
+reachable without a library change.
 
 `resolve_user_dn` and `resolve_group_dn` are public because they are independently useful and because
 `resolve-dn` is a valuable debugging subcommand. `resolve_group_dn` accepts either a DN or a CN: if
@@ -641,7 +652,13 @@ the argument does not parse as a DN, it searches `(&(objectCategory=group)(cn=<e
 ### 8.7 Manager traversal, and why the reporting tree is walked
 
 AD stores `manager` as a DN, so a manager lookup is inherently two steps: resolve the manager to a DN,
-then filter on it. **Direct reports** are one query — `eq_dn("manager", dn)` — and are cheap.
+then filter on it. Both steps are the library's: `direct_reports(username)` and
+`reporting_tree(username)` each take a **username** — the resolve key, one-to-one at a site — and
+resolve it to a manager DN internally, so no caller holds a DN to ask a manager question. Employee ID
+is not offered as a manager key: it is one-to-many, so it cannot name the one person a traversal
+starts from.
+
+**Direct reports** are one query — `eq_dn("manager", dn)` — and are cheap.
 
 A **reporting tree** is not one query. `LDAP_MATCHING_RULE_IN_CHAIN` on `manager` would resolve an
 entire tree in a single filter, which is what this document originally specified, but measurement
@@ -660,9 +677,14 @@ than the directory's:
 - **A traversal is not a filter.** It is several queries, so it cannot compose with other criteria into
   one query. A reporting tree therefore accepts no search criteria; callers filter the returned list.
 
-**Full depth stays opt-in.** The cost is now many cheap round trips rather than one very expensive
-DC-side query, but it is still the expensive operation, and reaching it is always explicit at the call
-site rather than a property of the directory's default behaviour.
+**Full depth is a separate name, not an argument.** The cost is now many cheap round trips rather
+than one very expensive DC-side query, but it is still the most expensive operation in the library,
+and a boolean argument is precisely what hid that: one `recursive=True` flipped a single filtered
+query into a multi-round traversal without changing the shape of the call, so the cliff was invisible
+at the call site and a wrong default reached it by accident. Two names make the expensive one
+impossible to invoke without asking for it, and leave each operation one contract to document rather
+than two contracts behind one signature. The CLI's `manager --all-reports` flag chooses which of the
+two the subcommand calls; the flag stops at the library boundary and is never passed through it.
 
 `in_chain()` stays in `filters.py`: the 600x finding is specific to `manager`, and group membership
 still uses the matching rule on `memberOf` (§8.8).
@@ -724,7 +746,12 @@ The CLI is thin by requirement, not aspiration. It exists for discovery and debu
 
 Subcommands: `employee`, `manager`, `cost-center`, `group`, `describe`, `server-info`, `resolve-dn`.
 Global flags: `--table` (default) / `--csv` / `--json`, `--raw`, `--attributes a,b,c`,
-`--include-disabled`, `--all-reports` / `--no-transitive`, `--debug`, `--insecure`.
+`--include-disabled`, `--debug`, `--insecure`.
+
+Two flags are **subcommand-scoped**, because each selects between two library operations rather than
+modifying one: `manager --all-reports` calls `reporting_tree` instead of `direct_reports` (§8.7), and
+`group --no-transitive` asks for direct membership only (§8.8). `manager` prints how many reports were
+found beneath the rendered result, which is what tells an operator a short answer from an empty one.
 
 `--raw` emits the unmapped `ldap3` dict as JSON, bypassing the `User` mapper. During schema discovery
 it is the only way to see what the directory is actually returning.
@@ -808,6 +835,10 @@ offline, without a directory.
 - The constructed `Server.tls.validate` is `ssl.CERT_REQUIRED`.
 - `LDAPConfig` with SIMPLE bind and `use_ssl=False` raises `LDAPConfigError`.
 - `LDAPConfig.from_env({})` raises `LDAPConfigError` — proving no baked-in server default.
+- A reporting tree containing a management cycle terminates, and a manager is never his own report.
+- A user reachable under two managers within one tree is returned exactly once.
+- A reporting level wider than `LDAPConfig.batch_size` is split across queries, and every report in it
+  is returned — including those found through the last, short batch.
 - No test in the suite opens a socket. An autouse fixture makes any connection attempt fail
   immediately rather than hang, and one test asserts that the guard itself still bites.
 - No real domain, server URI, or base DN appears in library source outside docstring examples.
@@ -853,7 +884,7 @@ offline, without a directory.
 | `src/adsearch/models.py` | `AttributeMap`, `User` |
 | `src/adsearch/search.py` | Connection lifecycle, the `ldap3` translation boundary (§6.2), paged search core, discovery, resolvers, wrappers |
 | `src/adsearch/cli.py` | argparse, output formatting, exit codes, `getpass`, `basicConfig` |
-| `tests/conftest.py` | The offline guard — no test opens a socket — and the fake-backed `searcher` helper |
+| `tests/conftest.py` | The offline guard — no test opens a socket — the fake-backed `searcher` helpers, and `unbindable` for a rejected bind |
 | `tests/fake_directory.py` | In-memory directory, filter matcher, and the fake connection behind the seam |
 | `tests/test_filters.py` | Filter construction, escaping, and DN validation — the security tests (§7.2, §13) |
 | `tests/test_config.py` | Required fields, credentials absent from representations, `from_env` |
@@ -862,6 +893,7 @@ offline, without a directory.
 | `tests/test_search.py` | Search behaviour through the connection seam |
 | `tests/test_errors.py` | The translation boundary and the error hierarchy (§6) |
 | `tests/test_fake_directory.py` | The fake's own filter matcher |
+| `tests/test_cli.py` | Argument parsing and rendering — the CLI's pure parts |
 
 ## Appendix B — References
 

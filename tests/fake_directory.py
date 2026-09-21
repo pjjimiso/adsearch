@@ -350,6 +350,10 @@ class FakeConnection:
 
     def __init__(self, directory: FakeDirectory) -> None:
         self.extend = _Extend(directory)
+        self.bound = True
+
+    def unbind(self) -> None:
+        self.bound = False
 
 
 class FakeDirectory:

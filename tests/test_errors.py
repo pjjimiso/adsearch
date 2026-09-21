@@ -37,7 +37,7 @@ from ldap3.core.exceptions import (
     LDAPUndefinedAttributeTypeResult,
 )
 
-from adsearch import errors
+from adsearch import cli, errors
 from adsearch.errors import (
     LDAPAuthError,
     LDAPConfigError,
@@ -210,12 +210,13 @@ def test_a_failure_partway_through_a_result_stream_raises_rather_than_returning_
     """DESIGN §8.3: an incomplete answer that resembles success is the most
     dangerous failure here. The fake raises only after yielding every matching
     entry, so `_search` is holding a complete-looking list of one user at the
-    moment the error arrives — the first assertion is what proves that."""
-    assert len(searcher(*DIRECTORY).find_reports(ANN)) == 1
+    moment the error arrives — the first assertion is what proves there was
+    something in hand to return."""
+    assert len(searcher(*DIRECTORY).find_users("123")) == 1
 
     ad = searcher(*DIRECTORY, failure=Failure(size_limit(), during="iteration"))
     with pytest.raises(LDAPQueryError):
-        ad.find_reports(ANN)
+        ad.find_users("123")
 
 
 @pytest.mark.parametrize(
@@ -236,37 +237,55 @@ def test_the_boundary_does_not_over_catch(error):
 
 OPERATIONS = {
     "conn": lambda ad: ad.conn,
+    "close": lambda ad: ad.close(),
     "find_users": lambda ad: ad.find_users("123"),
     "resolve_user_dn": lambda ad: ad.resolve_user_dn("alee"),
-    "find_reports": lambda ad: ad.find_reports(ANN),
-    "by_manager": lambda ad: ad.by_manager("alee"),
+    "direct_reports": lambda ad: ad.direct_reports("alee"),
+    "reporting_tree": lambda ad: ad.reporting_tree("alee"),
 }
 
-QUERIES = {name: call for name, call in OPERATIONS.items() if name != "conn"}
+# Everything that reaches the directory, and so must translate. `close` is
+# excluded by §8.1 rather than by oversight; the test below pins that.
+REACHES_THE_DIRECTORY = {
+    name: call for name, call in OPERATIONS.items() if name != "close"
+}
+QUERIES = {
+    name: call for name, call in REACHES_THE_DIRECTORY.items() if name != "conn"
+}
 
 
 def test_the_sweep_covers_every_public_operation():
     """The boundary's real claim is that a *newly added* query method cannot
     forget to translate, because `_search` is the only route out. That holds
     only while this sweep actually covers everything public, so a new operation
-    fails here until it is listed."""
+    fails here until it is listed — which is exactly what happened when
+    `direct_reports` and `reporting_tree` replaced `find_reports`."""
     assert {name for name in vars(LDAPSearch) if not name.startswith("_")} == set(OPERATIONS)
 
 
-def test_conn_is_the_only_public_operation_that_does_not_query():
-    """`conn` binds and returns; everything else reaches the directory through
-    `_search`. The split is what lets the query sweep below assume a failing
-    directory is enough to make each operation raise."""
-    assert set(OPERATIONS) - set(QUERIES) == {"conn"}
+def test_close_is_the_only_public_operation_outside_the_boundary():
+    """`close` neither binds nor queries, and §8.1 requires it to *swallow* a
+    teardown failure rather than translate one: an exception raised from
+    `__exit__` replaces whatever was already propagating out of the `with`
+    block, hiding the real failure. Translating there would reintroduce the
+    masking §8.1 exists to prevent, so `close` is excluded on purpose — and
+    `test_a_teardown_failure_does_not_replace_the_propagating_exception` in
+    test_search.py is what holds it to that.
+
+    `conn` binds and returns; everything else reaches the directory through
+    `_search`, which is what lets the query sweep assume a failing directory is
+    enough to make each operation raise."""
+    assert set(OPERATIONS) - set(REACHES_THE_DIRECTORY) == {"close"}
+    assert set(REACHES_THE_DIRECTORY) - set(QUERIES) == {"conn"}
 
 
-@pytest.mark.parametrize("operation", OPERATIONS)
+@pytest.mark.parametrize("operation", REACHES_THE_DIRECTORY)
 def test_no_ldap3_exception_escapes_when_the_bind_fails(operation):
     """The base class is the fault injected here on purpose: a boundary that
     listed only the specific types of §6.2 would let it through."""
     ad = unbindable(LDAPException(UNKNOWN))
     with pytest.raises(LDAPSearchError):
-        OPERATIONS[operation](ad)
+        REACHES_THE_DIRECTORY[operation](ad)
 
 
 @pytest.mark.parametrize("during", ["call", "iteration"])
@@ -276,6 +295,41 @@ def test_no_ldap3_exception_escapes_when_a_query_fails(operation, during):
     ad = searcher(*DIRECTORY, failure=failure)
     with pytest.raises(LDAPSearchError):
         QUERIES[operation](ad)
+
+
+def test_the_cli_test_subcommand_translates_a_failure_from_who_am_i(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The third place the library reaches the network, and the reason §6.2's
+    "two points" needed a footnote. `who_am_i()` is an extended operation
+    issued straight at the connection, past both handlers, so `test_command`
+    applies `translated()` itself. `adsearch test` exists to surface a bad bind
+    or a bad transport, which makes it the last command that should report one
+    as a raw ldap3 exception."""
+
+    class Unreachable:
+        """A bind that succeeded and an extended operation that then fails."""
+
+        bound = True
+
+        class extend:
+            class standard:
+                @staticmethod
+                def who_am_i() -> str:
+                    raise LDAPSocketReceiveError("error receiving data")
+
+    class Bound:
+        def __init__(self, config, *args, **kwargs) -> None:
+            self.conn = Unreachable()
+
+    monkeypatch.setenv("ADSEARCH_SERVER", "ldaps://dc.test.com")
+    monkeypatch.setenv("ADSEARCH_BASE_DN", "DC=test,DC=com")
+    monkeypatch.delenv("ADSEARCH_BIND_USER", raising=False)
+    monkeypatch.delenv("ADSEARCH_BIND_PASSWORD", raising=False)
+    monkeypatch.setattr(cli, "LDAPSearch", Bound)
+
+    with pytest.raises(LDAPConnectionError):
+        cli.test_command()
 
 
 # --- Exit codes stay out of the library (DESIGN §6.4) ------------------------
