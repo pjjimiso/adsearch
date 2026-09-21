@@ -67,9 +67,8 @@ def searcher(
 ) -> LDAPSearch:
     """An `LDAPSearch` backed by an in-memory directory instead of a socket.
 
-    `failure` makes the directory raise where a real one would, at the call or
-    partway through the result stream. The bind still succeeds, which is what
-    separates a query failure from the bind failure `unbindable` builds."""
+    `failure` makes the directory raise where a real one would. The bind still
+    succeeds, which is what separates it from `unbindable`."""
     ad, _connection = searcher_with_connection(
         *entries, referrals=referrals, failure=failure, config=config, attrs=attrs
     )
@@ -84,10 +83,9 @@ def unbindable(
 ) -> LDAPSearch:
     """An `LDAPSearch` whose connection factory raises instead of binding.
 
-    Binding is the whole of what the factory does — `open_connection` passes
-    `auto_bind`, so the bind happens inside `Connection.__init__` — which makes
-    a factory that raises a faithful stand-in for a rejected bind, and keeps
-    the `conn` property's own body running exactly as it does in production."""
+    `open_connection` passes `auto_bind`, so the bind happens inside
+    `Connection.__init__` — which makes a factory that raises a faithful stand-in
+    for a rejected bind."""
 
     def refuse(_config: LDAPConfig) -> Connection:
         raise error

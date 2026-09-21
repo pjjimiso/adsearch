@@ -60,10 +60,7 @@ def test_command() -> None:
     config = LDAPConfig.from_env()
     search = LDAPSearch(config)
     # who_am_i() is an extended operation issued straight at the connection,
-    # so it reaches the directory past both of the library's handlers (§6.2).
-    # Without this, `adsearch test` — the one command whose entire job is to
-    # surface a bad bind or a bad transport — is also the one path that reports
-    # it as a raw ldap3 exception.
+    # past both of the library's handlers (§6.2).
     with translated():
         print(f"bound: {search.conn.bound}")
         print(f"whoami: {search.conn.extend.standard.who_am_i()}")

@@ -86,12 +86,9 @@ class Entry:
 class Failure:
     """An error the directory raises instead of — or partway through — answering.
 
-    `during="call"` is the shape of a rejection the server issues outright: a
-    malformed filter, an undefined attribute. `during="iteration"` raises only
-    after every matching entry has been yielded, which is the shape that
-    matters here: `paged_search` hands back a generator, so a size limit or a
-    session the DC drops mid-stream arrives while results are being consumed.
-    A handler wrapped around the call alone would never see it."""
+    `during="iteration"` raises only after every matching entry has been
+    yielded, which is how a real paged search fails: during consumption, where
+    a handler wrapped around the call alone would never see it."""
 
     error: Exception
     during: Literal["call", "iteration"] = "call"
@@ -334,9 +331,8 @@ class _Standard:
                 "attributes": entry.project(attributes),
                 "type": "searchResEntry",
             }
-        # Last, not first: a failure that arrives only after partial results
-        # is what distinguishes a handler covering consumption from one
-        # covering the call.
+        # Last, not first: the point is a failure that arrives after partial
+        # results.
         self._directory.fail_now("iteration")
 
 

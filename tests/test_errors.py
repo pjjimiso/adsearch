@@ -1,16 +1,12 @@
 """The translation boundary (DESIGN §6), asserted from outside the library.
 
-A consumer catches `LDAPSearchError` and is done. That promise is only as good
-as the narrowest place it can leak, so these tests do not call `translated()`
-directly: they drive the public operations of `LDAPSearch` with a directory
-that raises where a real one would, and assert on what comes back out.
+These tests do not call `translated()` directly: they drive the public
+operations of `LDAPSearch` against a directory that raises where a real one
+would, and assert on what comes back out.
 
-Three fault sites matter and they are not the same. A bind rejection reaches
-only the `conn` property. `during="call"` is a rejection the server issues
-outright. `during="iteration"` arrives after entries have already been yielded,
-because `paged_search` hands back a generator — a handler wrapped around the
-call alone would let it straight through, and the caller would see a raw ldap3
-exception from inside a loop somewhere downstream.
+Three fault sites, and they are not the same: a bind rejection reaches only the
+`conn` property, `during="call"` is a rejection the server issues outright, and
+`during="iteration"` arrives after entries have already been yielded.
 """
 
 import ast
@@ -63,10 +59,9 @@ DIRECTORY = (
 
 
 def rejected_credentials() -> LDAPInvalidCredentialsResult:
-    """What a domain controller actually returns on a bad bind: result 49,
-    with the diagnostic sub-code buried in the message. `data 52e` is a wrong
-    password, `775` a locked-out account, `532` an expired one — a distinction
-    a consumer has to make and cannot reconstruct from the result code alone."""
+    """What a DC returns on a bad bind: result 49, with the diagnostic sub-code
+    buried in the message. `data 52e` is a wrong password, `775` a locked-out
+    account, `532` an expired one — indistinguishable from the result code."""
     return LDAPInvalidCredentialsResult(
         result=49, description="invalidCredentials", message=BAD_PASSWORD
     )
@@ -80,14 +75,9 @@ def size_limit() -> LDAPSizeLimitExceededResult:
 
 UNKNOWN = "something ldap3 has not given a name"
 
-# The mappings that hold wherever the failure happened. The bare base class is
-# absent on purpose: what an unnamed exception becomes depends on the site, and
-# `test_an_unrecognised_exception_is_filed_by_where_it_happened` owns that.
-#
-# Ordering is what these rows really protect. Every key below is an
-# `LDAPException`, so a handler that caught the base first would turn the whole
-# table into one type and still satisfy any test asking only whether something
-# from `adsearch` came out.
+# The mappings that hold wherever the failure happened; the bare base class is
+# site-dependent and has its own test. Every key below is an `LDAPException`, so
+# a handler catching the base first would turn the whole table into one type.
 TRANSLATIONS = {
     "LDAPBindError": (lambda: LDAPBindError("bind failed"), LDAPAuthError),
     "LDAPInvalidCredentialsResult": (rejected_credentials, LDAPAuthError),
@@ -99,9 +89,8 @@ TRANSLATIONS = {
         lambda: LDAPSocketReceiveError("error receiving data"),
         LDAPConnectionError,
     ),
-    # Named individually in neither §6.2's original table nor the AC, and the
-    # reason the handler now catches the communication family rather than three
-    # of its members: a send that fails mid-search is not a bad filter.
+    # Why the handler catches the communication family, not three of its
+    # members: a send that fails mid-search is not a bad filter.
     "LDAPSocketSendError": (
         lambda: LDAPSocketSendError("error sending data"),
         LDAPConnectionError,
@@ -110,9 +99,8 @@ TRANSLATIONS = {
         lambda: LDAPSessionTerminatedByServerError("session terminated by server"),
         LDAPConnectionError,
     ),
-    # §6.1 promises a timeout is a connection failure, and `open_connection`
-    # sets `receive_timeout`, so this arrives in production rather than in
-    # theory. It is outside the communication family, hence its own entry.
+    # `open_connection` sets `receive_timeout`, so this arrives in production
+    # rather than in theory. Outside the communication family, hence its own row.
     "LDAPResponseTimeoutError": (
         lambda: LDAPResponseTimeoutError("no response received"),
         LDAPConnectionError,
@@ -153,8 +141,7 @@ def fails_at(site: Site, error: Exception) -> None:
     """Drive a public operation into `error`, raised at `site`.
 
     `find_users` stands in for every query because `_search` is the only route
-    to the directory; the sweep further down is what proves that claim rather
-    than assuming it."""
+    to the directory — which the sweep further down proves rather than assumes."""
     if site == "bind":
         unbindable(error).conn
     else:
@@ -182,12 +169,9 @@ def test_every_ldap3_exception_is_translated_wherever_it_is_raised(name, site):
 
 
 def test_an_unrecognised_exception_is_filed_by_where_it_happened():
-    """A bind issues no query, so reporting an unnamed bind-time failure as a
-    query error tells the caller to go and fix a filter that was never sent.
-    The site is the only thing known about an exception ldap3 has not given a
-    name, so the site decides — and it is exactly these unnamed types that
-    decide whether a consumer can retry a transient network fault without
-    retrying a bad password."""
+    """The site is the only thing known about an exception ldap3 has not named,
+    so the site decides. A bind issues no query, and calling a bind-time failure
+    a query error sends the caller to debug a filter that was never sent."""
     with pytest.raises(LDAPConnectionError):
         fails_at("bind", LDAPException(UNKNOWN))
     for site in ("call", "iteration"):
@@ -196,10 +180,9 @@ def test_an_unrecognised_exception_is_filed_by_where_it_happened():
 
 
 def test_the_diagnostic_sub_code_survives_translation():
-    """DESIGN §6.2. Losing the message leaves a consumer unable to tell a wrong
-    password from a locked account, which is the one thing `LDAPAuthError` is
-    for. The cause carries it, and so does the message, so neither
-    `str(e)` nor `e.__cause__` alone is a dead end."""
+    """Losing the message leaves a consumer unable to tell a wrong password from
+    a locked account. Both the cause and the message carry it, so neither is a
+    dead end."""
     with pytest.raises(LDAPAuthError) as caught:
         unbindable(rejected_credentials()).conn
     assert "data 52e" in str(caught.value)
@@ -208,10 +191,9 @@ def test_the_diagnostic_sub_code_survives_translation():
 
 def test_a_failure_partway_through_a_result_stream_raises_rather_than_returning_what_arrived():
     """DESIGN §8.3: an incomplete answer that resembles success is the most
-    dangerous failure here. The fake raises only after yielding every matching
-    entry, so `_search` is holding a complete-looking list of one user at the
-    moment the error arrives — the first assertion is what proves there was
-    something in hand to return."""
+    dangerous failure here. The fake raises only after yielding every match, so
+    `_search` has a complete-looking list of one user when the error arrives,
+    which is what the first assertion proves."""
     assert len(searcher(*DIRECTORY).find_users("123")) == 1
 
     ad = searcher(*DIRECTORY, failure=Failure(size_limit(), during="iteration"))
@@ -255,26 +237,20 @@ QUERIES = {
 
 
 def test_the_sweep_covers_every_public_operation():
-    """The boundary's real claim is that a *newly added* query method cannot
-    forget to translate, because `_search` is the only route out. That holds
-    only while this sweep actually covers everything public, so a new operation
-    fails here until it is listed — which is exactly what happened when
-    `direct_reports` and `reporting_tree` replaced `find_reports`."""
+    """The claim is that a *newly added* query method cannot forget to
+    translate, because `_search` is the only route out. That holds only while
+    this sweep covers everything public, so a new operation fails here until it
+    is listed — as `direct_reports` and `reporting_tree` did."""
     assert {name for name in vars(LDAPSearch) if not name.startswith("_")} == set(OPERATIONS)
 
 
 def test_close_is_the_only_public_operation_outside_the_boundary():
-    """`close` neither binds nor queries, and §8.1 requires it to *swallow* a
-    teardown failure rather than translate one: an exception raised from
-    `__exit__` replaces whatever was already propagating out of the `with`
-    block, hiding the real failure. Translating there would reintroduce the
-    masking §8.1 exists to prevent, so `close` is excluded on purpose — and
-    `test_a_teardown_failure_does_not_replace_the_propagating_exception` in
-    test_search.py is what holds it to that.
-
-    `conn` binds and returns; everything else reaches the directory through
-    `_search`, which is what lets the query sweep assume a failing directory is
-    enough to make each operation raise."""
+    """§8.1 requires `close` to *swallow* a teardown failure, not translate it:
+    an exception from `__exit__` replaces whatever was already propagating out
+    of the `with` block. A translated escaping error is still an escaping error,
+    so `close` is excluded on purpose — test_search.py's
+    `test_a_teardown_failure_does_not_replace_the_propagating_exception` holds
+    it to that. `conn` binds; everything else queries."""
     assert set(OPERATIONS) - set(REACHES_THE_DIRECTORY) == {"close"}
     assert set(REACHES_THE_DIRECTORY) - set(QUERIES) == {"conn"}
 
@@ -300,12 +276,10 @@ def test_no_ldap3_exception_escapes_when_a_query_fails(operation, during):
 def test_the_cli_test_subcommand_translates_a_failure_from_who_am_i(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """The third place the library reaches the network, and the reason §6.2's
-    "two points" needed a footnote. `who_am_i()` is an extended operation
-    issued straight at the connection, past both handlers, so `test_command`
-    applies `translated()` itself. `adsearch test` exists to surface a bad bind
-    or a bad transport, which makes it the last command that should report one
-    as a raw ldap3 exception."""
+    """The third place the library reaches the network. `who_am_i()` is issued
+    straight at the connection, past both handlers, so `test_command` applies
+    `translated()` itself — and `adsearch test` exists to surface a bad bind,
+    which makes it the last command that should report one raw."""
 
     class Unreachable:
         """A bind that succeeded and an extended operation that then fails."""
@@ -356,8 +330,8 @@ def test_the_hierarchy_is_exactly_the_six_classes_design_names():
 
 def test_no_error_carries_an_exit_code():
     """DESIGN §6.4: the exit-code map belongs to `cli.py`, because a library
-    does not own the process. Translation is where an exit code is most
-    tempting to attach, since it is the moment a failure is first classified."""
+    does not own the process. Translation is where one is most tempting to
+    attach, being the moment a failure is first classified."""
     for error in HIERARCHY:
         added = {
             name
