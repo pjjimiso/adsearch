@@ -141,36 +141,67 @@ class LDAPSearch:
         return entries[0]["dn"]
 
 
-    def find_reports(self, dn: str, *, recursive: bool = False) -> list[User]:
-        """Find all users who reports to the given manager. Non-recursive returns
-        direct reports only, while recursive returns the entire reporting tree"""
-        reports = self._search_users(all_of(USER_OBJECT, eq_dn(self._attrs.manager, dn)))
-        if recursive is False: 
-            return reports
-
-        all_reports = reports.copy()
-        seen = {dn}
-        current_level = [r["dn"] for r in reports]
-        seen.update(current_level)
-
-        while current_level:
-            found = []
-            for batch in batched(current_level, self._config.batch_size):
-                clauses  = [eq_dn(self._attrs.manager, dn) for dn in batch]
-                found.extend(self._search_users(all_of(USER_OBJECT, any_of(*clauses))))
-            new = [r for r in found if r["dn"] not in seen]
-            seen.update(r["dn"] for r in new)
-            all_reports.extend(new)
-            current_level = [r["dn"] for r in new]
-
-        return all_reports
+    def _reports_of(self, manager_dns: Sequence[str]) -> list[User]:
+        """Every user whose manager is one of `manager_dns`, one query per
+        `LDAPConfig.batch_size` DNs. A single DN is a single query: `any_of`
+        collapses a one-clause disjunction, so the one-hop case pays nothing
+        for being expressed the same way as a traversal level."""
+        found: list[User] = []
+        for batch in batched(manager_dns, self._config.batch_size):
+            clauses = [eq_dn(self._attrs.manager, dn) for dn in batch]
+            found.extend(self._search_users(all_of(USER_OBJECT, any_of(*clauses))))
+        return found
 
 
-    def by_manager(self, username: str, *, recursive: bool = False) -> list[User]:
-        """A wrapper around find_reports that returns a list of users reporting to
-        the specified manager by manager's username."""
-        dn = self.resolve_user_dn(username)
-        return self.find_reports(dn, recursive=recursive)
+    def direct_reports(self, username: str) -> list[User]:
+        """The users whose manager is this manager: one hop, one query.
+
+        Takes a username rather than a DN because `manager` holds a DN and
+        resolving it is this library's job, not the caller's (CONTEXT.md)."""
+        return self._reports_of([self.resolve_user_dn(username)])
+
+
+    def reporting_tree(self, username: str) -> list[User]:
+        """Every direct report of this manager, and every direct report of
+        those, to any depth.
+
+        The expensive operation in this library: a breadth-first walk of one
+        round trip per batch per level, deliberately not the directory's
+        `LDAP_MATCHING_RULE_IN_CHAIN` (ADR-0001). It is a separate name from
+        `direct_reports` rather than a flag on it so that its cost is always
+        visible at the call site."""
+        return self._walk_reports(self.resolve_user_dn(username))
+
+
+    def _walk_reports(self, root_dn: str) -> list[User]:
+        """Breadth-first from `root_dn`, one level at a time, until a level
+        yields nobody new.
+
+        The seen set is what makes the walk terminate and the result honest:
+        a management cycle re-reaches a DN already visited, and a user under
+        two managers within the tree is discovered twice. Both are dropped by
+        the same check. `root_dn` seeds it, so a manager who manages himself
+        is not reported as his own report. Keys are case-folded because DN
+        comparison in Active Directory ignores case.
+
+        A DN is marked seen as it is taken, not once the level is done: one
+        level is several queries, and a user under two managers that fall in
+        different batches is answered by both of them."""
+        seen = {root_dn.casefold()}
+        tree: list[User] = []
+        level = [root_dn]
+
+        while level:
+            new: list[User] = []
+            for report in self._reports_of(level):
+                if report["dn"].casefold() in seen:
+                    continue
+                seen.add(report["dn"].casefold())
+                new.append(report)
+            tree.extend(new)
+            level = [report["dn"] for report in new]
+
+        return tree
 
 
 #   We'll re-implement this later after building out find_users more

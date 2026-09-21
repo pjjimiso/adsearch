@@ -9,7 +9,8 @@ from adsearch.models import User
 
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The whole command surface, assembled without running anything."""
     common = argparse.ArgumentParser(add_help=False)
     group = common.add_mutually_exclusive_group()
     group.add_argument("--table", dest="fmt", action="store_const", const="table", 
@@ -28,28 +29,29 @@ def main() -> None:
     employee_id_parser = subparsers.add_parser("employee", parents=[common], help="Search for a user by employee id")
     employee_id_parser.add_argument("employee_id", type=str, help="employee id")
 
-    manager_parser = subparsers.add_parser("manager", parents=[common], help="Search for direct reports of a manager by username")
+    manager_parser = subparsers.add_parser("manager", parents=[common], help="Search for a manager's direct reports by username")
     manager_parser.add_argument("username", type=str, help="manager username")
-    manager_parser.add_argument("--recursive", action="store_true", help="Transverse the manager's entire reporting tree")
+    manager_parser.add_argument("--all-reports", action="store_true",
+                                help="Walk the manager's entire reporting tree instead of one hop. Many queries; see ADR-0001")
 
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     match args.command:
         case "test": 
             test_command()
-            pass
 
         case "employee":
             results = employee_id_command(args.employee_id)
             print(format_users(results, args.fmt))
-            pass
 
         case "manager":
-            results = manager_command(args.username, recursive=args.recursive)
-            print(format_users(results, args.fmt))
-            print()
-            print(len(results), 'report(s) found')
-            pass
+            results = manager_command(args.username, all_reports=args.all_reports)
+            print(render_reports(results, args.fmt))
 
         case _:
             parser.print_help()
@@ -68,10 +70,15 @@ def employee_id_command(id: str) -> list[User]:
     return search.find_users(employee_id=id)
 
 
-def manager_command(username: str, recursive: bool = False) -> list[User]:
+def manager_command(username: str, *, all_reports: bool = False) -> list[User]:
+    """Two named library operations, one subcommand. The flag chooses which
+    call is made; it is not passed to the library, where selecting a traversal
+    with a boolean is what hid its cost (ADR-0001)."""
     config = LDAPConfig.from_env()
     search = LDAPSearch(config)
-    return search.by_manager(username, recursive=recursive)
+    if all_reports:
+        return search.reporting_tree(username)
+    return search.direct_reports(username)
 
 
 _COLUMNS = ("username", "dn", "name", "employee_id", "email")
@@ -116,6 +123,13 @@ def build_table(rows: list[list[str]], widths: list[int]) -> str:
                 dashes.append("-" * w)
             lines.append("  ".join(dashes))
     return "\n".join(lines)
+
+
+def render_reports(users: list[User], fmt: str) -> str:
+    """The manager subcommand's output: the people who report to the manager,
+    rendered in `fmt`, and how many of them there were. The count is what
+    tells an operator a short answer from an empty one."""
+    return f"{format_users(users, fmt)}\n\n{len(users)} report(s) found"
 
 
 def format_users(users: list[User], fmt: str) -> str: 
