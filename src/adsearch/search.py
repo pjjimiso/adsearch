@@ -1,3 +1,4 @@
+import logging
 import ssl
 
 from collections.abc import Callable, Sequence
@@ -25,6 +26,8 @@ from adsearch.filters import (
     eq_dn,
 )
 
+
+logger = logging.getLogger(__name__)
 
 ConnectionFactory = Callable[[LDAPConfig], Connection]
 
@@ -93,8 +96,38 @@ class LDAPSearch:
         return self._conn
 
 
+    def close(self) -> None:
+        """Unbind the connection if one was opened.
+
+        Safe to call more than once, and swallows any error raised during
+        teardown: an exception raised from `__exit__` replaces whatever
+        exception was already propagating out of a `with` block, hiding the
+        real failure (§8.1)."""
+        if self._conn is not None:
+            conn, self._conn = self._conn, None
+            try:
+                conn.unbind()
+            except Exception:
+                pass
+
+
+    def __enter__(self) -> "LDAPSearch":
+        return self
+
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object,
+    ) -> None:
+        self.close()
+
+
     def _search(self, search_filter: str, attributes: Sequence[str]) -> list[dict]:
         """Runs a paged subtree search and returns raw entries."""
+        # Debug only: filter values carry names and employee IDs (§7.4).
+        logger.debug("search base=%s filter=%s", self._config.base_dn, search_filter)
         results = []
         response = self.conn.extend.standard.paged_search(
             search_base=self._config.base_dn,

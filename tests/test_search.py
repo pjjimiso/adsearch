@@ -10,6 +10,8 @@ Nothing opens a socket, and no test asserts result order: a real paged_search
 yields each page in reverse.
 """
 
+import logging
+
 from dataclasses import replace
 from typing import cast
 
@@ -219,3 +221,53 @@ def test_a_level_wider_than_the_default_batch_size_returns_every_report():
     tree = ad.reporting_tree("alee")
     assert len(tree) == 604
     assert {u["username"] for u in tree} >= {"kid0", "kid1", "kid2", "kid3"}
+
+
+def test_context_manager_releases_the_connection_on_exit():
+    directory = FakeDirectory(user(ANN, sAMAccountName="alee", employeeID="123"))
+    connection = directory.connection()
+    ad = LDAPSearch(CONFIG, connect=lambda _config: cast(Connection, connection))
+
+    with ad as opened:
+        assert opened is ad
+        opened.find_users("123")
+
+    assert connection.bound is False
+
+
+def test_close_is_safe_to_call_repeatedly():
+    directory = FakeDirectory(user(ANN, sAMAccountName="alee"))
+    connection = directory.connection()
+    ad = LDAPSearch(CONFIG, connect=lambda _config: cast(Connection, connection))
+
+    ad.conn  # force the lazy connection open
+    ad.close()
+    ad.close()
+
+
+def test_a_teardown_failure_does_not_replace_the_propagating_exception():
+    directory = FakeDirectory(user(ANN, sAMAccountName="alee"))
+    connection = directory.connection()
+
+    def failing_unbind() -> None:
+        raise RuntimeError("boom during teardown")
+
+    connection.unbind = failing_unbind
+    ad = LDAPSearch(CONFIG, connect=lambda _config: cast(Connection, connection))
+
+    with pytest.raises(ValueError, match="from inside the block"):
+        with ad:
+            ad.conn
+            raise ValueError("from inside the block")
+
+
+def test_search_filter_values_are_logged_at_debug_and_nothing_higher(caplog: pytest.LogCaptureFixture):
+    """DESIGN §7.4: filter values carry names and employee IDs, so they may
+    only ever surface at debug."""
+    ad = searcher(user(ANN, sAMAccountName="alee", employeeID="123"))
+    with caplog.at_level(logging.DEBUG, logger="adsearch.search"):
+        ad.find_users("123")
+
+    assert caplog.records
+    assert any("123" in record.getMessage() for record in caplog.records)
+    assert all(record.levelno == logging.DEBUG for record in caplog.records)
