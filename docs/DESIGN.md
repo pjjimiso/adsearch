@@ -205,7 +205,9 @@ from adsearch import (
 
 Filter helpers remain importable from `adsearch.filters` but are **not** re-exported at top level.
 They exist for building custom `extra_filter` values, not for everyday use, and promoting them would
-widen the compatibility surface for a rare case.
+widen the compatibility surface for a rare case. `search.translated()`, `build_server` and
+`open_connection` have the same status for the same reason: importable from their module, used by
+`cli.py`, and deliberately absent from the list above, which is the whole compatibility promise.
 
 ### 4.2 Intended usage
 
@@ -346,13 +348,49 @@ then `ldap3` is part of the contract permanently and can never be replaced.
 | `ldap3` exception | Re-raised as |
 |---|---|
 | `LDAPBindError`, `LDAPInvalidCredentialsResult` | `LDAPAuthError` |
-| `LDAPSocketOpenError`, `LDAPSocketReceiveError`, `LDAPSessionTerminatedByServerError` | `LDAPConnectionError` |
-| `LDAPInvalidFilterError`, `LDAPUndefinedAttributeTypeResult`, `LDAPSizeLimitExceededResult` | `LDAPQueryError` |
-| bare `LDAPException` | `LDAPQueryError` (catch-all, ordered **last**) |
+| `LDAPCommunicationError` **and its whole family**; `LDAPResponseTimeoutError`, `LDAPMaximumRetriesError`; the TLS group (`LDAPStartTLSError`, `LDAPCertificateError`, `LDAPSSLConfigurationError`, `LDAPSSLNotSupportedError`, `LDAPInvalidTlsSpecificationError`) | `LDAPConnectionError` |
+| `LDAPInvalidFilterError`, `LDAPUndefinedAttributeTypeResult`, `LDAPSizeLimitExceededResult`, `LDAPTimeLimitExceededResult` | `LDAPQueryError` |
+| anything else from `LDAPException` | the **site's** fallback (ordered **last**) |
 
-Translation always uses `raise ... from exc`. The original `ldap3` message carries the AD diagnostic
-sub-code — `data 52e` is a bad password, `data 775` a locked-out account, `data 532` an expired
-password — and discarding it makes authentication failures nearly undiagnosable.
+Ordering is the whole of the table's correctness. `LDAPSocketOpenError` *is* an `LDAPException`, so a
+handler that caught the base first would collapse every row into one type and still satisfy any test
+that asked only whether something from `adsearch` came out.
+
+**The connection row names a family, not members.** An earlier draft of this section listed three
+socket exceptions by name, which left `LDAPSocketSendError`, `LDAPSocketCloseError` and —
+worst — `LDAPResponseTimeoutError` falling through to the catch-all and reaching callers labelled
+query errors. `open_connection` sets `receive_timeout`, so that was a live path, and it broke the one
+distinction §6.1 exists to draw: a caller cannot retry a transient network fault without retrying a
+bad password if a timeout arrives as a bad filter. The TLS group is listed for the same reason: §6.1
+promises DNS, TCP, TLS **and timeout** all arrive as `LDAPConnectionError`.
+
+**The fallback follows the site.** A bind issues no query, so an exception `ldap3` has not given a
+name becomes `LDAPConnectionError` at the `conn` property and `LDAPQueryError` at the search. The site
+is the only thing known about an unrecognised failure, and calling a bind-time one a query error sends
+the caller to debug a filter that was never sent.
+
+Nothing outside `ldap3`'s hierarchy is caught. A `NotFoundError`, a filter rejection raised by
+`filters.py`, and a plain bug in this library all pass through untouched; a handler written as
+`except Exception` would satisfy the table above while quietly relabelling all three.
+
+Translation always uses `raise ... from exc`, and also carries `str(exc)` onto the new exception. The
+original `ldap3` message carries the AD diagnostic sub-code — `data 52e` is a bad password, `data 775`
+a locked-out account, `data 532` an expired password — and discarding it makes authentication failures
+nearly undiagnosable. Carrying it both ways means neither `str(e)` nor `e.__cause__` is a dead end.
+
+**Where it lives.** `search.translated()` is a context manager wrapping blocks, applied at exactly the
+two points this library reaches the network: the `conn` property, the only place a bind occurs, and
+`_search`, the only place a query occurs. Two handlers rather than one per method, and a query method
+added later cannot forget to translate because there is no other route out.
+
+It wraps a block rather than decorating a method for one reason: `paged_search` returns a generator,
+so a size limit or a session the DC drops arrives while `_search` is *consuming* results, not when it
+calls. The result loop is therefore inside the handler. Leaving it outside would return the entries
+that did arrive — an incomplete answer wearing the shape of a complete one (§8.3).
+
+`cli.py`'s `test` subcommand issues `who_am_i()` straight at the connection, past both handlers, and
+wraps that call in `translated()` itself. It is the one command whose entire job is to surface a bad
+bind, so it is the last place a raw `ldap3` exception should appear.
 
 ### 6.3 Empty results are not errors
 
@@ -495,9 +533,13 @@ the rest of the constructor narrow.
 `connect` defaults to `open_connection`, the module-level factory that assembles the `Tls`, `Server`
 and `Connection`; a test passes one that returns a fake, and the connection stays lazy either way.
 Substitution happens *inside* the property rather than by pre-seeding `_conn`, so the property's own
-body still runs under a fake. That is what reserves the property as the place the bind-error
-translation of §6.2 can land without a second seam being invented for it. This is the library's one
-injection seam: everything that reaches the network funnels through it.
+body still runs under a fake. That is what lets the bind-error translation of §6.2 live in the
+property without a second seam being invented for it, and it is why a test can assert on a translated
+bind rejection at all. This is the library's one injection seam: everything that reaches the network
+funnels through it.
+
+A failed bind leaves `_conn` as `None`, so an instance is never left half-open: a caller that fixes
+its credentials and retries gets a fresh attempt rather than a permanent failure.
 
 The connection is **lazy**, created and bound on first access to the `conn` property. This keeps
 construction, argument validation, and the entire offline test suite off the network.
@@ -544,6 +586,10 @@ it resembles success.
 
 The core also accepts a `limit` that short-circuits the generator, which is what makes
 `resolve_user_dn`'s `limit=2` ambiguity check cheap.
+
+The generator is also why §6.2's handler wraps the result loop and not merely the `paged_search` call:
+a failure the server raises partway through a result set arrives during consumption, and returning
+what had already arrived would be the same resembles-success failure in a second guise.
 
 ### 8.4 Referrals
 
@@ -741,6 +787,11 @@ rather than `Any`.
 | Seaming the test suite at the internal search | Seaming at the connection property | Paging lives in the internal search, and the result cap and error translation are specified to land there too; faking it would put all three beyond reach of a test (§8.1) |
 | A fake keyed on expected filter strings | An in-memory directory with a filter matcher | The reporting-tree walk batches manager DNs into disjunctions whose text depends on `batch_size`; no hand-maintained expected filter survives a level wider than one batch (§8.7) |
 | `ldap3`'s own `MOCK_SYNC` strategy | A hand-written fake directory | `MOCK_SYNC` raises `LDAPDefinitionError` on extensible match — exactly the matching rule transitive group membership needs (§8.8) |
+| A `try`/`except` per public method | Two handlers, at the bind and at the query | Per-method translation is a rule a new method can forget; the two network sites are the only routes out (§6.2) |
+| A decorator on `_search` | A context manager wrapping the call *and* the result loop | Equivalent only while `_search` happens to consume the generator itself, and nothing would keep that true (§6.2) |
+| Translating in `errors.py` | Translating in `search.py` | `errors.py` imports nothing, which is what keeps exit codes and `ldap3` both out of it (§3.2, §6.4) |
+| Naming socket exceptions one at a time | Catching `LDAPCommunicationError`, the family | Three named members left a failed send and a response timeout arriving as query errors — the exact distinction §6.1 exists to draw (§6.2) |
+| One catch-all type for both handlers | A fallback that follows the site | A bind issues no query; an unnamed bind-time failure called a query error sends the caller to debug a filter that was never sent (§6.2) |
 
 ---
 
@@ -760,6 +811,16 @@ offline, without a directory.
 - No test in the suite opens a socket. An autouse fixture makes any connection attempt fail
   immediately rather than hang, and one test asserts that the guard itself still bites.
 - No real domain, server URI, or base DN appears in library source outside docstring examples.
+- No `ldap3` exception escapes any public operation of `LDAPSearch`, whether raised at the bind, at
+  the search call, or partway through the result stream. The test enumerating those operations is
+  checked against the class, so a new public method fails it until it is covered.
+- A translated error's `__cause__` is the original `ldap3` exception, and the AD diagnostic sub-code
+  is readable from both the cause and the message.
+- A response timeout, a failed socket send and a TLS failure arrive as `LDAPConnectionError`, not as
+  `LDAPQueryError`. This is what makes §6.1's "retry the network, not the password" distinction real
+  rather than nominal.
+- The exception hierarchy is exactly the six classes of §6.1, none of which carries an exit code, and
+  `errors.py` contains no imports.
 - Against a live directory: a group with more than 1000 members returns more than 1000 entries, and
   transitive and non-transitive group queries return different counts.
 
@@ -790,7 +851,7 @@ offline, without a directory.
 | `src/adsearch/config.py` | `LDAPConfig`, `from_env`, transport validation |
 | `src/adsearch/filters.py` | Pure filter construction and escaping; the injection boundary |
 | `src/adsearch/models.py` | `AttributeMap`, `User` |
-| `src/adsearch/search.py` | Connection lifecycle, paged search core, discovery, resolvers, wrappers |
+| `src/adsearch/search.py` | Connection lifecycle, the `ldap3` translation boundary (§6.2), paged search core, discovery, resolvers, wrappers |
 | `src/adsearch/cli.py` | argparse, output formatting, exit codes, `getpass`, `basicConfig` |
 | `tests/conftest.py` | The offline guard — no test opens a socket — and the fake-backed `searcher` helper |
 | `tests/fake_directory.py` | In-memory directory, filter matcher, and the fake connection behind the seam |
@@ -799,6 +860,7 @@ offline, without a directory.
 | `tests/test_models.py` | `AttributeMap`'s requested attribute list |
 | `tests/test_transport.py` | Certificate validation required (§7.3), and the offline guard itself |
 | `tests/test_search.py` | Search behaviour through the connection seam |
+| `tests/test_errors.py` | The translation boundary and the error hierarchy (§6) |
 | `tests/test_fake_directory.py` | The fake's own filter matcher |
 
 ## Appendix B — References

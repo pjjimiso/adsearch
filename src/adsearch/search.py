@@ -1,6 +1,7 @@
 import ssl
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from itertools import batched
 
 from ldap3 import (
@@ -13,10 +14,33 @@ from ldap3 import (
     Server,
     Tls
 )
+from ldap3.core.exceptions import (
+    LDAPBindError,
+    LDAPCertificateError,
+    LDAPCommunicationError,
+    LDAPException,
+    LDAPInvalidCredentialsResult,
+    LDAPInvalidFilterError,
+    LDAPInvalidTlsSpecificationError,
+    LDAPMaximumRetriesError,
+    LDAPResponseTimeoutError,
+    LDAPSizeLimitExceededResult,
+    LDAPSSLConfigurationError,
+    LDAPSSLNotSupportedError,
+    LDAPStartTLSError,
+    LDAPTimeLimitExceededResult,
+    LDAPUndefinedAttributeTypeResult,
+)
 
 from adsearch.config import LDAPConfig
 from adsearch.models import DEFAULT_ATTRIBUTES, AttributeMap, User, to_user
-from adsearch.errors import NotFoundError
+from adsearch.errors import (
+    LDAPAuthError,
+    LDAPConnectionError,
+    LDAPQueryError,
+    LDAPSearchError,
+    NotFoundError,
+)
 from adsearch.filters import (
     USER_OBJECT, 
     eq, 
@@ -27,6 +51,83 @@ from adsearch.filters import (
 
 
 ConnectionFactory = Callable[[LDAPConfig], Connection]
+
+
+AUTH_ERRORS = (LDAPBindError, LDAPInvalidCredentialsResult)
+
+CONNECTION_ERRORS = (
+    # The whole communication family, not the three members §6.2 first named:
+    # a failed send, a socket the DC closed and an unintelligible response are
+    # connection failures every bit as much as a failed open. Naming members
+    # one at a time is what let `LDAPSocketSendError` reach a caller labelled
+    # a query error.
+    LDAPCommunicationError,
+    # §6.1 promises a timeout is a connection failure, and `open_connection`
+    # sets `receive_timeout`, so this is a live path rather than a hypothetical.
+    LDAPResponseTimeoutError,
+    LDAPMaximumRetriesError,
+    # §6.1 lists TLS alongside DNS and TCP. These are raised while assembling
+    # or negotiating the transport, all of it inside `open_connection`.
+    LDAPStartTLSError,
+    LDAPCertificateError,
+    LDAPSSLConfigurationError,
+    LDAPSSLNotSupportedError,
+    LDAPInvalidTlsSpecificationError,
+)
+
+QUERY_ERRORS = (
+    LDAPInvalidFilterError,
+    LDAPUndefinedAttributeTypeResult,
+    LDAPSizeLimitExceededResult,
+    LDAPTimeLimitExceededResult,
+)
+
+
+@contextmanager
+def translated(fallback: type[LDAPSearchError] = LDAPQueryError) -> Iterator[None]:
+    """Re-raise anything `ldap3` throws as this library's own error (§6.2).
+
+    The whole point is that `ldap3` never reaches a consumer: if a caller has
+    to write `except LDAPSocketOpenError`, the client library is part of the
+    public contract permanently and can never be replaced.
+
+    This wraps blocks rather than decorating methods so it can cover the
+    *consumption* of a paged search as well as the call. `paged_search` hands
+    back a generator, so a size limit or a dropped session surfaces while
+    results are being read — a decorator on `_search` would still catch it,
+    but only because `_search` consumes the generator itself, and nothing
+    would keep that true.
+
+    `except` clauses are tried in order, so the specific families come first
+    and the base class last; inverting that would collapse every failure into
+    one type while still satisfying any test that only asked whether
+    *something* from `adsearch` came out. Nothing outside `ldap3`'s hierarchy
+    is caught: `NotFoundError`, a filter rejection, and a plain bug in this
+    library all pass through untouched.
+
+    `fallback` is what an `ldap3` exception none of the families names becomes,
+    and it differs by where the failure happened, because that is the only
+    thing known about it. A bind issues no query, so an unrecognised failure
+    there is a connection problem; calling it a query error would tell a
+    caller to fix a filter that was never sent, and telling a transient
+    network fault apart from a bad password is the whole reason these types
+    are distinct.
+
+    `str(exc)` is carried onto the new exception as well as being reachable
+    through `__cause__`, because the message is where Active Directory puts
+    its diagnostic sub-code — `data 52e` for a bad password, `775` for a
+    locked-out account, `532` for an expired one — and a consumer that can
+    only see `LDAPAuthError` cannot tell those apart."""
+    try:
+        yield
+    except AUTH_ERRORS as exc:
+        raise LDAPAuthError(str(exc)) from exc
+    except CONNECTION_ERRORS as exc:
+        raise LDAPConnectionError(str(exc)) from exc
+    except QUERY_ERRORS as exc:
+        raise LDAPQueryError(str(exc)) from exc
+    except LDAPException as exc:
+        raise fallback(str(exc)) from exc
 
 
 def build_server(config: LDAPConfig) -> Server:
@@ -87,28 +188,46 @@ class LDAPSearch:
 
     @property
     def conn(self) -> Connection:
-        """The connection, opened and bound on first use."""
+        """The connection, opened and bound on first use.
+
+        One of the two places this library reaches the network, and the only
+        one that binds — which is what makes it the only place a bind
+        rejection can be translated (§6.2). `_conn` stays `None` on failure,
+        so a caller that fixes its credentials and retries is not stuck with
+        a half-open instance."""
         if self._conn is None:
-            self._conn = self._connect(self._config)
+            with translated(LDAPConnectionError):
+                self._conn = self._connect(self._config)
         return self._conn
 
 
     def _search(self, search_filter: str, attributes: Sequence[str]) -> list[dict]:
-        """Runs a paged subtree search and returns raw entries."""
+        """Runs a paged subtree search and returns raw entries.
+
+        The other place this library reaches the network, and the only place
+        it queries — so a query method added later cannot forget to translate,
+        because there is no other route out.
+
+        The loop is inside `translated()`, not just the call: `paged_search`
+        returns a generator, so a failure the server raises partway through a
+        result set arrives here during consumption. Leaving the loop outside
+        would return the entries that did arrive, which is an incomplete
+        answer wearing the shape of a complete one (§8.3)."""
         results = []
-        response = self.conn.extend.standard.paged_search(
-            search_base=self._config.base_dn,
-            search_filter=search_filter,
-            attributes=attributes,
-            search_scope=SUBTREE,
-            paged_size=self._config.page_size,
-            time_limit=self._config.time_limit,
-            generator=True,
-        )
-        for entry in response:
-            # ignore referrals (searchResRef)
-            if entry["type"] == "searchResEntry":
-                results.append(entry)
+        with translated():
+            response = self.conn.extend.standard.paged_search(
+                search_base=self._config.base_dn,
+                search_filter=search_filter,
+                attributes=attributes,
+                search_scope=SUBTREE,
+                paged_size=self._config.page_size,
+                time_limit=self._config.time_limit,
+                generator=True,
+            )
+            for entry in response:
+                # ignore referrals (searchResRef)
+                if entry["type"] == "searchResEntry":
+                    results.append(entry)
         return results
 
 

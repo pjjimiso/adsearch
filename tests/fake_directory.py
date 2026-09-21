@@ -14,6 +14,7 @@ import re
 
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from typing import Literal
 
 from ldap3 import NO_ATTRIBUTES, SUBTREE
 
@@ -79,6 +80,21 @@ class Entry:
             if values:
                 projected[name] = list(values)
         return projected
+
+
+@dataclass(frozen=True)
+class Failure:
+    """An error the directory raises instead of — or partway through — answering.
+
+    `during="call"` is the shape of a rejection the server issues outright: a
+    malformed filter, an undefined attribute. `during="iteration"` raises only
+    after every matching entry has been yielded, which is the shape that
+    matters here: `paged_search` hands back a generator, so a size limit or a
+    session the DC drops mid-stream arrives while results are being consumed.
+    A handler wrapped around the call alone would never see it."""
+
+    error: Exception
+    during: Literal["call", "iteration"] = "call"
 
 
 @dataclass(frozen=True)
@@ -300,6 +316,7 @@ class _Standard:
         rather than taken as `**kwargs`, so a renamed keyword fails loudly here
         instead of being silently swallowed. `paged_size` is accepted and
         ignored: chunking changes nothing `_search` can observe."""
+        self._directory.fail_now("call")
         stream = self._stream(search_base, search_filter, attributes)
         return stream if generator else list(stream)
 
@@ -317,6 +334,10 @@ class _Standard:
                 "attributes": entry.project(attributes),
                 "type": "searchResEntry",
             }
+        # Last, not first: a failure that arrives only after partial results
+        # is what distinguishes a handler covering consumption from one
+        # covering the call.
+        self._directory.fail_now("iteration")
 
 
 class _Extend:
@@ -332,10 +353,21 @@ class FakeConnection:
 
 
 class FakeDirectory:
-    def __init__(self, *entries: Entry, referrals: Sequence[str] = ()) -> None:
+    def __init__(
+        self,
+        *entries: Entry,
+        referrals: Sequence[str] = (),
+        failure: Failure | None = None,
+    ) -> None:
         self._entries = list(entries)
         self._by_dn = {_fold(entry.dn): entry for entry in entries}
         self.referrals = list(referrals)
+        self.failure = failure
+
+    def fail_now(self, during: Literal["call", "iteration"]) -> None:
+        """Raise the configured failure if this is the point it was set for."""
+        if self.failure is not None and self.failure.during == during:
+            raise self.failure.error
 
     def entry(self, dn: str) -> Entry | None:
         return self._by_dn.get(_fold(dn))
