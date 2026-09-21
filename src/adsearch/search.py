@@ -1,8 +1,7 @@
 import ssl
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from itertools import batched
-from dataclasses import replace
 
 from ldap3 import (
     SIMPLE, 
@@ -27,45 +26,70 @@ from adsearch.filters import (
 )
 
 
+ConnectionFactory = Callable[[LDAPConfig], Connection]
+
+
+def build_server(config: LDAPConfig) -> Server:
+    """The transport configuration, assembled without opening anything.
+
+    `Server` resolves addresses at open time rather than at construction, which
+    is what makes this callable offline and the certificate invariant (§7.3)
+    assertable without a socket. The `Tls` is built here rather than passed in
+    because `Server(use_ssl=True, tls=None)` silently substitutes a default
+    `Tls()` with `validate=CERT_NONE` — so the assertion that matters is on the
+    assembled server, not on a `Tls` that may never have reached it."""
+    if config.validate_cert:
+        cert_validation = ssl.CERT_REQUIRED
+    else:
+        cert_validation = ssl.CERT_NONE
+
+    tls = Tls(
+        validate = cert_validation,
+        ca_certs_file = config.ca_certs_file
+    )
+    return Server(
+        host = config.server,
+        use_ssl = config.use_ssl,
+        tls = tls,
+        get_info = NONE,
+        connect_timeout = config.connect_timeout,
+    )
+
+
+def open_connection(config: LDAPConfig) -> Connection:
+    """Build and bind a connection. The only place this library opens a socket."""
+    return Connection(
+        build_server(config),
+        user = config.bind_user,
+        password = config.bind_password,
+        authentication = SIMPLE,
+        auto_bind = AUTO_BIND_NO_TLS,
+        raise_exceptions = True,
+        receive_timeout = config.receive_timeout,
+        auto_referrals = False,
+        auto_range = True,
+    )
+
 
 class LDAPSearch:
-    def __init__(self, config: LDAPConfig, attrs: AttributeMap = DEFAULT_ATTRIBUTES) -> None:
+    def __init__(
+        self,
+        config: LDAPConfig,
+        attrs: AttributeMap = DEFAULT_ATTRIBUTES,
+        *,
+        connect: ConnectionFactory | None = None,
+    ) -> None:
         self._conn: Connection | None = None
         self._config = config
         self._attrs = attrs
+        self._connect: ConnectionFactory = open_connection if connect is None else connect
 
 
     @property
     def conn(self) -> Connection:
+        """The connection, opened and bound on first use."""
         if self._conn is None:
-            if self._config.validate_cert:
-                cert_validation = ssl.CERT_REQUIRED
-            else:
-                cert_validation = ssl.CERT_NONE
-
-            tls = Tls(
-                validate = cert_validation,
-                ca_certs_file = self._config.ca_certs_file
-            )
-            server = Server(
-                host = self._config.server,
-                use_ssl = self._config.use_ssl,
-                tls = tls,
-                get_info = NONE,
-                connect_timeout = self._config.connect_timeout,
-            )
-            connection = Connection(
-                server,
-                user = self._config.bind_user,
-                password = self._config.bind_password,
-                authentication = SIMPLE,
-                auto_bind = AUTO_BIND_NO_TLS,
-                raise_exceptions = True,
-                receive_timeout = self._config.receive_timeout,
-                auto_referrals = False,
-                auto_range = True,
-            )
-            self._conn = connection
+            self._conn = self._connect(self._config)
         return self._conn
 
 

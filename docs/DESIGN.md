@@ -466,8 +466,11 @@ SIMPLE bind transmits the password in cleartext inside whatever tunnel exists. G
   file. Should file-based configuration be added later, it should *raise* on a password key rather
   than honor it.
 
-An offline test asserts `Server.tls.validate == ssl.CERT_REQUIRED` on the constructed server, as a
-cheap regression guard against the `CERT_NONE` default silently returning after a refactor.
+An offline test asserts `build_server(cfg).tls.validate == ssl.CERT_REQUIRED` on the constructed
+server, as a cheap regression guard against the `CERT_NONE` default silently returning after a
+refactor. The assertion is on the *server* rather than on the `Tls` deliberately: `ldap3` substitutes
+a default `Tls()` — with `validate=CERT_NONE` — whenever `use_ssl=True` and `tls=None`, so a correct
+`Tls` that a refactor forgot to pass along would still pass a test that only inspected the `Tls`.
 
 ### 7.4 Logging
 
@@ -482,9 +485,19 @@ and a library that calls `basicConfig` hijacks its consumer's setup.
 
 ### 8.1 Connection lifecycle
 
-`LDAPSearch.__init__` takes exactly two parameters — `config: LDAPConfig` and
-`attrs: AttributeMap = DEFAULT_ATTRS` — and performs no I/O. A wide keyword-argument constructor is
-where defaults drift out of sync with `LDAPConfig` and where `bind_password` ends up in a log line.
+`LDAPSearch.__init__` takes `config: LDAPConfig`, `attrs: AttributeMap = DEFAULT_ATTRS`, and one
+keyword-only `connect` factory — and performs no I/O. The constructor stays narrow for a specific
+reason: a wide keyword-argument constructor is where defaults drift out of sync with `LDAPConfig`
+and where `bind_password` ends up in a log line. `connect` is neither. It carries no default that
+could drift from `LDAPConfig` and no credential, and it is the single substitution point that keeps
+the rest of the constructor narrow.
+
+`connect` defaults to `open_connection`, the module-level factory that assembles the `Tls`, `Server`
+and `Connection`; a test passes one that returns a fake, and the connection stays lazy either way.
+Substitution happens *inside* the property rather than by pre-seeding `_conn`, so the property's own
+body still runs under a fake. That is what reserves the property as the place the bind-error
+translation of §6.2 can land without a second seam being invented for it. This is the library's one
+injection seam: everything that reaches the network funnels through it.
 
 The connection is **lazy**, created and bound on first access to the `conn` property. This keeps
 construction, argument validation, and the entire offline test suite off the network.
@@ -496,6 +509,10 @@ searches over one connection. Rebinding per method would double the latency of e
 raised from `__exit__` replaces the exception already propagating, hiding the real failure.
 
 ### 8.2 `ldap3` construction
+
+Construction splits in two by whether it performs I/O: `build_server(config)` assembles the `Tls` and
+`Server` and opens nothing, and `open_connection(config)` binds and is the only place this library
+opens a socket. `build_server` is what the offline transport test of §7.3 calls.
 
 Every argument below is set explicitly, because the defaults are wrong for this use case and one of
 them is dangerous.
@@ -721,6 +738,9 @@ rather than `Any`.
 | A dataclass for `User` | `TypedDict` | Direct JSON serialization; consumers treat results as plain data (§5.3) |
 | Dumping the AD schema for discovery | Dumping one populated user | The schema lists what is *defined*, not what is *populated* (§9) |
 | Re-exporting filter helpers at top level | `adsearch.filters` only | Every public name is a permanent compatibility promise (§4.1) |
+| Seaming the test suite at the internal search | Seaming at the connection property | Paging lives in the internal search, and the result cap and error translation are specified to land there too; faking it would put all three beyond reach of a test (§8.1) |
+| A fake keyed on expected filter strings | An in-memory directory with a filter matcher | The reporting-tree walk batches manager DNs into disjunctions whose text depends on `batch_size`; no hand-maintained expected filter survives a level wider than one batch (§8.7) |
+| `ldap3`'s own `MOCK_SYNC` strategy | A hand-written fake directory | `MOCK_SYNC` raises `LDAPDefinitionError` on extensible match — exactly the matching rule transitive group membership needs (§8.8) |
 
 ---
 
@@ -737,6 +757,8 @@ offline, without a directory.
 - The constructed `Server.tls.validate` is `ssl.CERT_REQUIRED`.
 - `LDAPConfig` with SIMPLE bind and `use_ssl=False` raises `LDAPConfigError`.
 - `LDAPConfig.from_env({})` raises `LDAPConfigError` — proving no baked-in server default.
+- No test in the suite opens a socket. An autouse fixture makes any connection attempt fail
+  immediately rather than hang, and one test asserts that the guard itself still bites.
 - No real domain, server URI, or base DN appears in library source outside docstring examples.
 - Against a live directory: a group with more than 1000 members returns more than 1000 entries, and
   transitive and non-transitive group queries return different counts.
@@ -770,7 +792,14 @@ offline, without a directory.
 | `src/adsearch/models.py` | `AttributeMap`, `User` |
 | `src/adsearch/search.py` | Connection lifecycle, paged search core, discovery, resolvers, wrappers |
 | `src/adsearch/cli.py` | argparse, output formatting, exit codes, `getpass`, `basicConfig` |
-| `tests/test_filters.py` | The offline security tests (§13) |
+| `tests/conftest.py` | The offline guard — no test opens a socket — and the fake-backed `searcher` helper |
+| `tests/fake_directory.py` | In-memory directory, filter matcher, and the fake connection behind the seam |
+| `tests/test_filters.py` | Filter construction, escaping, and DN validation — the security tests (§7.2, §13) |
+| `tests/test_config.py` | Required fields, credentials absent from representations, `from_env` |
+| `tests/test_models.py` | `AttributeMap`'s requested attribute list |
+| `tests/test_transport.py` | Certificate validation required (§7.3), and the offline guard itself |
+| `tests/test_search.py` | Search behaviour through the connection seam |
+| `tests/test_fake_directory.py` | The fake's own filter matcher |
 
 ## Appendix B — References
 
