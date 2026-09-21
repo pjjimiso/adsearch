@@ -22,7 +22,7 @@ from ldap3 import Connection
 from adsearch.errors import NotFoundError
 from adsearch.search import LDAPSearch
 
-from tests.conftest import ANN, BASE_DN, BO, CY, CONFIG, searcher
+from tests.conftest import ANN, BASE_DN, BO, CY, CONFIG, searcher, searcher_with_connection
 from tests.fake_directory import Entry, FakeDirectory, reports_to, user
 
 DI = f"CN=Di Pu,OU=Users,{BASE_DN}"
@@ -224,9 +224,7 @@ def test_a_level_wider_than_the_default_batch_size_returns_every_report():
 
 
 def test_context_manager_releases_the_connection_on_exit():
-    directory = FakeDirectory(user(ANN, sAMAccountName="alee", employeeID="123"))
-    connection = directory.connection()
-    ad = LDAPSearch(CONFIG, connect=lambda _config: cast(Connection, connection))
+    ad, connection = searcher_with_connection(user(ANN, sAMAccountName="alee", employeeID="123"))
 
     with ad as opened:
         assert opened is ad
@@ -236,9 +234,7 @@ def test_context_manager_releases_the_connection_on_exit():
 
 
 def test_close_is_safe_to_call_repeatedly():
-    directory = FakeDirectory(user(ANN, sAMAccountName="alee"))
-    connection = directory.connection()
-    ad = LDAPSearch(CONFIG, connect=lambda _config: cast(Connection, connection))
+    ad, _connection = searcher_with_connection(user(ANN, sAMAccountName="alee"))
 
     ad.conn  # force the lazy connection open
     ad.close()
@@ -246,14 +242,12 @@ def test_close_is_safe_to_call_repeatedly():
 
 
 def test_a_teardown_failure_does_not_replace_the_propagating_exception():
-    directory = FakeDirectory(user(ANN, sAMAccountName="alee"))
-    connection = directory.connection()
+    ad, connection = searcher_with_connection(user(ANN, sAMAccountName="alee"))
 
     def failing_unbind() -> None:
         raise RuntimeError("boom during teardown")
 
     connection.unbind = failing_unbind
-    ad = LDAPSearch(CONFIG, connect=lambda _config: cast(Connection, connection))
 
     with pytest.raises(ValueError, match="from inside the block"):
         with ad:

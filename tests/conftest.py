@@ -11,7 +11,7 @@ from adsearch.config import LDAPConfig
 from adsearch.models import DEFAULT_ATTRIBUTES, AttributeMap
 from adsearch.search import LDAPSearch
 
-from tests.fake_directory import Entry, FakeDirectory
+from tests.fake_directory import Entry, FakeConnection, FakeDirectory
 
 
 BASE_DN = "DC=test,DC=com"
@@ -40,16 +40,31 @@ def offline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "getaddrinfo", refuse)
 
 
+def searcher_with_connection(
+    *entries: Entry,
+    referrals: Sequence[str] = (),
+    config: LDAPConfig = CONFIG,
+    attrs: AttributeMap = DEFAULT_ATTRIBUTES,
+) -> tuple[LDAPSearch, FakeConnection]:
+    """Like `searcher`, but also hands back the raw fake connection for tests
+    that need to assert on it directly — e.g. that it was unbound on exit.
+
+    The cast is the one lie in this suite: `FakeConnection` implements the
+    slice of ldap3's `Connection` that `adsearch` uses, and nothing else."""
+    directory = FakeDirectory(*entries, referrals=referrals)
+    connection = directory.connection()
+    ad = LDAPSearch(config, attrs, connect=lambda _config: cast(Connection, connection))
+    return ad, connection
+
+
 def searcher(
     *entries: Entry,
     referrals: Sequence[str] = (),
     config: LDAPConfig = CONFIG,
     attrs: AttributeMap = DEFAULT_ATTRIBUTES,
 ) -> LDAPSearch:
-    """An `LDAPSearch` backed by an in-memory directory instead of a socket.
-
-    The cast is the one lie in this suite: `FakeConnection` implements the
-    slice of ldap3's `Connection` that `adsearch` uses, and nothing else."""
-    directory = FakeDirectory(*entries, referrals=referrals)
-    connection = cast(Connection, directory.connection())
-    return LDAPSearch(config, attrs, connect=lambda _config: connection)
+    """An `LDAPSearch` backed by an in-memory directory instead of a socket."""
+    ad, _connection = searcher_with_connection(
+        *entries, referrals=referrals, config=config, attrs=attrs
+    )
+    return ad
