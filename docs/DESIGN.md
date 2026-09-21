@@ -18,7 +18,7 @@ A generic Python library for querying Active Directory over LDAP.
 | Question | Entry point |
 |---|---|
 | Who is this employee ID? | `by_employee_id` |
-| Who reports to this manager (by employee ID)? | `by_manager_id` |
+| Who reports to this manager (by username)? | `by_manager` |
 | Who is in this cost center? | `by_cost_center` |
 | Who is in this group? | `by_group` |
 | Who has this attribute value? | `by_attribute` |
@@ -74,7 +74,7 @@ containing every attribute that was requested. A consumer adds its site-specific
 `AttributeMap.extra`, reads it back out of `attributes`, and classifies there. The library never needs
 to know what a blue badge is.
 
-Callers who prefer local vocabulary alias at their own boundary (`get_reports = ad.by_manager_id`),
+Callers who prefer local vocabulary alias at their own boundary (`get_reports = ad.by_manager`),
 which keeps site jargon in the site's repository.
 
 The library also does not do: retry with backoff (fail fast — retry policy is the caller's decision),
@@ -211,7 +211,7 @@ widen the compatibility surface for a rare case.
 
 ```python
 with LDAPSearch(LDAPConfig.from_env(), attrs=MY_SCHEMA) as ad:
-    reports = ad.by_manager_id("12345678")
+    reports = ad.by_manager("jdoe")
 ```
 
 `with` is the supported form and is documented as such. A library that leaves sockets open until
@@ -360,13 +360,21 @@ password — and discarding it makes authentication failures nearly undiagnosabl
 > `NotFoundError` means "the query rests on a premise that does not exist."
 
 `find_users` returning `[]` is correct. A *resolve* step that must succeed returning nothing is not:
-the `[]` that would otherwise be returned from `by_manager_id` is indistinguishable from "this manager
-has no reports", and the caller has no way to tell the difference.
+the `[]` that would otherwise be returned from a manager lookup is indistinguishable from "this
+manager has no reports", and the caller has no way to tell the difference.
 
 `resolve_user_dn` therefore raises on **0 matches and on 2 or more**. Never picking the first of an
-ambiguous match is deliberate — a silently wrong pick corrupts the caller's entire result set
-undetectably, and duplicate employee IDs are a directory data-quality problem worth surfacing loudly.
-Resolves search with `limit=2`, which is sufficient to detect ambiguity without paging the directory.
+ambiguous match is deliberate: a silently wrong pick corrupts the caller's entire result set
+undetectably. Resolves search with `limit=2`, which is sufficient to detect ambiguity without paging
+the directory.
+
+**Which key is safe to resolve on.** `username` is one-to-one, which is what makes it the resolve key.
+**`employee_id` is one-to-many and is therefore a search key, never a resolve key** — at the target
+site one employee ID legitimately matches several directory entries. Searching by it returns a list,
+and no operation here resolves on it. `resolve_user_dn`'s `by` override *can* be pointed at the
+employee-ID attribute, and doing so raises `NotFoundError` on perfectly ordinary data — which is what
+"never a resolve key" means in practice, rather than a data-quality alarm worth surfacing loudly.
+Both terms are defined in `CONTEXT.md`.
 
 ### 6.4 Exit codes belong to the CLI
 
@@ -481,7 +489,7 @@ where defaults drift out of sync with `LDAPConfig` and where `bind_password` end
 The connection is **lazy**, created and bound on first access to the `conn` property. This keeps
 construction, argument validation, and the entire offline test suite off the network.
 
-There is **one bind per instance**. `by_manager_id` performs a resolve followed by a search — two
+There is **one bind per instance**. `by_manager` performs a resolve followed by a search — two
 searches over one connection. Rebinding per method would double the latency of every call.
 
 `close()` unbinds if connected, is safe to call repeatedly, and swallows teardown errors: an exception
@@ -567,15 +575,34 @@ attribute a consumer cares about is reachable without a library change.
 the argument does not parse as a DN, it searches `(&(objectCategory=group)(cn=<escaped>))` under
 `group_base_dn`, which is what lets callers pass friendly group names.
 
-### 8.7 Manager traversal, and why it defaults to non-transitive
+### 8.7 Manager traversal, and why the reporting tree is walked
 
-AD stores `manager` as a DN, so a lookup by employee ID is inherently two steps: resolve the manager's
-DN, then filter on it. Direct reports use `eq_dn("manager", dn)`; the full chain uses
-`in_chain("manager", dn)`.
+AD stores `manager` as a DN, so a manager lookup is inherently two steps: resolve the manager to a DN,
+then filter on it. **Direct reports** are one query — `eq_dn("manager", dn)` — and are cheap.
 
-**`transitive=False` is the default.** `LDAP_MATCHING_RULE_IN_CHAIN` on `manager` walks an entire org
-subtree — for a senior executive, tens of thousands of entries and a very expensive DC-side query.
-Expensive operations are opt-in.
+A **reporting tree** is not one query. `LDAP_MATCHING_RULE_IN_CHAIN` on `manager` would resolve an
+entire tree in a single filter, which is what this document originally specified, but measurement
+against a ~40,000-employee tree put it roughly **600x slower** than walking the tree level by level.
+It is not used. **See [ADR-0001](adr/0001-bfs-over-in-chain.md) for the measurement and the decision;
+the one-line matching-rule call is the regression to guard against, not the shortcut to take.**
+
+The walk is breadth-first: query the manager's direct reports, batch that level's DNs into
+`any_of(eq_dn("manager", d) …)` queries of `LDAPConfig.batch_size` DNs apiece, and repeat until a
+level yields nothing new. Three consequences follow, and each is this library's responsibility rather
+than the directory's:
+
+- **Cycle detection is ours.** A DN already seen is never traversed or returned a second time, so a
+  management cycle in the directory terminates the walk rather than hanging the caller's process.
+- **A user reachable under two managers within one tree is returned once**, by the same seen-set.
+- **A traversal is not a filter.** It is several queries, so it cannot compose with other criteria into
+  one query. A reporting tree therefore accepts no search criteria; callers filter the returned list.
+
+**Full depth stays opt-in.** The cost is now many cheap round trips rather than one very expensive
+DC-side query, but it is still the expensive operation, and reaching it is always explicit at the call
+site rather than a property of the directory's default behaviour.
+
+`in_chain()` stays in `filters.py`: the 600x finding is specific to `manager`, and group membership
+still uses the matching rule on `memberOf` (§8.8).
 
 ### 8.8 Group membership, and why it defaults to the opposite
 
@@ -589,10 +616,12 @@ group's `member` attribute, for three reasons:
    trips.
 3. `member` includes nested *group* objects, which would have to be recursed manually.
 
-**`transitive=True` is the default here** — the inverse of §8.7. The question being asked is "who
-actually holds this access", and a nested group silently hiding members is the wrong answer that
-matters. The asymmetry between the two defaults is deliberate: it follows from which wrong answer is
-more damaging in each case, not from consistency for its own sake.
+**`transitive=True` is the default here** — the inverse of the reporting-tree stance in §8.7, where
+full depth stays opt-in. The question being asked is "who actually holds this access", and a nested
+group silently hiding members is the wrong answer that matters. The asymmetry is deliberate: it
+follows from which wrong answer is more damaging in each case, not from consistency for its own sake.
+Note that the justification differs too — §8.7 rests on a measurement, this rests on correctness, so
+an unfavourable group benchmark would change the mechanism here and not the default.
 
 Documented caveat: neither `member` nor `memberOf` reflects `primaryGroupID`, which is stored as an
 integer RID on the user rather than as a link. In practice this affects only Domain Users and is
@@ -631,8 +660,8 @@ before any query semantics are involved — which is the main justification for 
 The CLI is thin by requirement, not aspiration. It exists for discovery and debugging.
 
 Subcommands: `employee`, `manager`, `cost-center`, `group`, `describe`, `server-info`, `resolve-dn`.
-Global flags: `--json` (default), `--raw`, `--attributes a,b,c`, `--include-disabled`,
-`--all-reports` / `--no-transitive`, `--debug`, `--insecure`.
+Global flags: `--table` (default) / `--csv` / `--json`, `--raw`, `--attributes a,b,c`,
+`--include-disabled`, `--all-reports` / `--no-transitive`, `--debug`, `--insecure`.
 
 `--raw` emits the unmapped `ldap3` dict as JSON, bypassing the `User` mapper. During schema discovery
 it is the only way to see what the directory is actually returning.
@@ -649,8 +678,10 @@ def format_users(users: list[User], fmt: str) -> str:
     """Render users as json | csv | table."""
 ```
 
-JSON is implemented; CSV and table output are planned. Isolating the decision behind this seam means
-adding them touches one function — which is the concrete, testable meaning of "thin CLI".
+Table, CSV, and JSON are all implemented. What the seam buys is a single *decision point*, not a
+single function: `format_users` is the only place the CLI chooses a rendering, though table output
+carries its own row and column-width helpers beside it. One decision point is the concrete, testable
+meaning of "thin CLI".
 
 ---
 
@@ -719,7 +750,6 @@ offline, without a directory.
   than mitigating it with TLS, at the cost of a more complex `LDAPConfig` and a platform dependency.
 - **Single server, no failover.** `LDAPConfig.server` is one URI; multi-DC failover would interact
   with the one-bind-per-instance decision in §8.1.
-- **CSV and table output are unimplemented**, though the seam for them exists (§10).
 - **`extra_filter` is an unvalidated passthrough** by design (§7.2). It is the one place a caller can
   construct arbitrary filter syntax, and it is documented as trusted-input-only.
 - **Development occurs above the declared Python floor** (§11), so 3.12 compatibility requires an
