@@ -36,11 +36,8 @@ def build_server(config: LDAPConfig) -> Server:
     """The transport configuration, assembled without opening anything.
 
     `Server` resolves addresses at open time rather than at construction, which
-    is what makes this callable offline and the certificate invariant (§7.3)
-    assertable without a socket. The `Tls` is built here rather than passed in
-    because `Server(use_ssl=True, tls=None)` silently substitutes a default
-    `Tls()` with `validate=CERT_NONE` — so the assertion that matters is on the
-    assembled server, not on a `Tls` that may never have reached it."""
+    is what makes this callable offline and the certificate invariant assertable 
+    without a socket."""
     if config.validate_cert:
         cert_validation = ssl.CERT_REQUIRED
     else:
@@ -176,9 +173,7 @@ class LDAPSearch:
 
     def _reports_of(self, manager_dns: Sequence[str]) -> list[User]:
         """Every user whose manager is one of `manager_dns`, one query per
-        `LDAPConfig.batch_size` DNs. A single DN is a single query: `any_of`
-        collapses a one-clause disjunction, so the one-hop case pays nothing
-        for being expressed the same way as a traversal level."""
+        `LDAPConfig.batch_size` DNs."""
         found: list[User] = []
         for batch in batched(manager_dns, self._config.batch_size):
             clauses = [eq_dn(self._attrs.manager, dn) for dn in batch]
@@ -187,39 +182,19 @@ class LDAPSearch:
 
 
     def direct_reports(self, username: str) -> list[User]:
-        """The users whose manager is this manager: one hop, one query.
-
-        Takes a username rather than a DN because `manager` holds a DN and
-        resolving it is this library's job, not the caller's (CONTEXT.md)."""
+        """The users whose manager is this manager: one hop, one query."""
         return self._reports_of([self.resolve_user_dn(username)])
 
 
     def reporting_tree(self, username: str) -> list[User]:
         """Every direct report of this manager, and every direct report of
-        those, to any depth.
-
-        The expensive operation in this library: a breadth-first walk of one
-        round trip per batch per level, deliberately not the directory's
-        `LDAP_MATCHING_RULE_IN_CHAIN` (ADR-0001). It is a separate name from
-        `direct_reports` rather than a flag on it so that its cost is always
-        visible at the call site."""
+        those, to any depth."""
         return self._walk_reports(self.resolve_user_dn(username))
 
 
     def _walk_reports(self, root_dn: str) -> list[User]:
         """Breadth-first from `root_dn`, one level at a time, until a level
-        yields nobody new.
-
-        The seen set is what makes the walk terminate and the result honest:
-        a management cycle re-reaches a DN already visited, and a user under
-        two managers within the tree is discovered twice. Both are dropped by
-        the same check. `root_dn` seeds it, so a manager who manages himself
-        is not reported as his own report. Keys are case-folded because DN
-        comparison in Active Directory ignores case.
-
-        A DN is marked seen as it is taken, not once the level is done: one
-        level is several queries, and a user under two managers that fall in
-        different batches is answered by both of them."""
+        yields nobody new."""
         seen = {root_dn.casefold()}
         tree: list[User] = []
         level = [root_dn]

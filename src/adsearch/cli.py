@@ -10,7 +10,6 @@ from adsearch.models import User
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """The whole command surface, assembled without running anything."""
     common = argparse.ArgumentParser(add_help=False)
     group = common.add_mutually_exclusive_group()
     group.add_argument("--table", dest="fmt", action="store_const", const="table", 
@@ -71,9 +70,6 @@ def employee_id_command(id: str) -> list[User]:
 
 
 def manager_command(username: str, *, all_reports: bool = False) -> list[User]:
-    """Two named library operations, one subcommand. The flag chooses which
-    call is made; it is not passed to the library, where selecting a traversal
-    with a boolean is what hid its cost (ADR-0001)."""
     config = LDAPConfig.from_env()
     search = LDAPSearch(config)
     if all_reports:
@@ -126,9 +122,7 @@ def build_table(rows: list[list[str]], widths: list[int]) -> str:
 
 
 def render_reports(users: list[User], fmt: str) -> str:
-    """The manager subcommand's output: the people who report to the manager,
-    rendered in `fmt`, and how many of them there were. The count is what
-    tells an operator a short answer from an empty one."""
+    """The manager subcommand's output: the people who report to the manager"""
     return f"{format_users(users, fmt)}\n\n{len(users)} report(s) found"
 
 
