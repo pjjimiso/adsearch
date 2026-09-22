@@ -1,11 +1,15 @@
 """An in-memory directory and a connection-shaped object that queries it.
 
 The fake exists so that everything downstream of `LDAPSearch.conn` — paging,
-referral skipping, and later the result cap and error translation — runs for
-real in tests. It is a directory with a filter matcher, not a lookup table
-keyed on filter strings: the reporting-tree walk batches manager DNs into
-disjunctions whose exact text depends on `LDAPConfig.batch_size`, so no
-hand-maintained expected filter survives a level wider than one batch.
+referral skipping, the result cap and error translation — runs for real in
+tests. `consumed` tallies the entries handed to the client, which is the only
+place a cap that stops the generator is distinguishable from one that truncates
+a list it already collected.
+
+It is a directory with a filter matcher, not a lookup table keyed on filter
+strings: the reporting-tree walk batches manager DNs into disjunctions whose
+exact text depends on `LDAPConfig.batch_size`, so no hand-maintained expected
+filter survives a level wider than one batch.
 """
 
 from __future__ import annotations
@@ -326,6 +330,7 @@ class _Standard:
             # loudly, rather than yielding a malformed user.
             yield {"uri": [uri], "type": "searchResRef"}
         for entry in self._directory.search(search_base, search_filter):
+            self._directory.pulled()
             yield {
                 "dn": entry.dn,
                 "attributes": entry.project(attributes),
@@ -363,6 +368,12 @@ class FakeDirectory:
         self._by_dn = {_fold(entry.dn): entry for entry in entries}
         self.referrals = list(referrals)
         self.failure = failure
+        self.consumed = 0
+
+    def pulled(self) -> None:
+        """One entry handed over. Called before the yield, so the tally is what
+        the client took rather than what matched."""
+        self.consumed += 1
 
     def fail_now(self, during: Literal["call", "iteration"]) -> None:
         """Raise the configured failure if this is the point it was set for."""

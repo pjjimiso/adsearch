@@ -3,7 +3,7 @@ import ssl
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from itertools import batched
+from itertools import batched, islice
 
 from ldap3 import (
     SIMPLE, 
@@ -195,16 +195,24 @@ class LDAPSearch:
         self.close()
 
 
-    def _search(self, search_filter: str, attributes: Sequence[str]) -> list[dict]:
-        """Runs a paged subtree search and returns raw entries.
+    def _search(
+        self,
+        search_filter: str,
+        attributes: Sequence[str],
+        *,
+        limit: int | None = None,
+    ) -> list[dict]:
+        """Runs a paged subtree search and returns at most `limit` raw entries.
 
         The only place this library queries, so a query method added later
         cannot forget to translate. The result loop is inside `translated()`
         because `paged_search` returns a generator: a failure partway through
-        arrives during consumption, not at the call."""
+        arrives during consumption, not at the call.
+
+        `limit` stops consuming that generator rather than trimming a finished
+        list, so the pages behind it are never fetched (§8.3)."""
         # Debug only: filter values carry names and employee IDs (§7.4).
         logger.debug("search base=%s filter=%s", self._config.base_dn, search_filter)
-        results = []
         with translated():
             response = self.conn.extend.standard.paged_search(
                 search_base=self._config.base_dn,
@@ -215,10 +223,10 @@ class LDAPSearch:
                 time_limit=self._config.time_limit,
                 generator=True,
             )
-            for entry in response:
-                # ignore referrals (searchResRef)
-                if entry["type"] == "searchResEntry":
-                    results.append(entry)
+            # Referrals (searchResRef) are dropped before the cap counts, so
+            # they cannot spend it (§8.4).
+            entries = (e for e in response if e["type"] == "searchResEntry")
+            results = list(islice(entries, limit))
         return results
 
 
@@ -239,15 +247,16 @@ class LDAPSearch:
     def resolve_user_dn(self, value: str, *, by: str | None = None) -> str: 
         """DN of the single user whose `by` attribute equals `value`.
         `by` defaults to the AttributeMap's username attribute (sAMAccountName).
-        Raises NotFoundError on no match and on multiple matches."""
+        Raises NotFoundError on no match and on multiple matches, which it
+        names rather than counting: the search stops at the second."""
         attribute = self._attrs.username if by is None else by
         search_filter = all_of(USER_OBJECT, eq(attribute, value))
-        entries = self._search(search_filter, [NO_ATTRIBUTES])
-        count = len(entries)
-        if count == 0:
+        entries = self._search(search_filter, [NO_ATTRIBUTES], limit=2)
+        if not entries:
             raise NotFoundError(f"No user found with {attribute}={value}")
-        if count > 1: 
-            raise NotFoundError(f"Found {count} with {attribute}={value}: {[e["dn"] for e in entries]}")
+        if len(entries) > 1:
+            matches = ", ".join(entry["dn"] for entry in entries)
+            raise NotFoundError(f"More than one user with {attribute}={value}: {matches}")
         return entries[0]["dn"]
 
 

@@ -3,8 +3,8 @@
 Every test here runs the real `_search` body — referral skipping, entry mapping,
 and whatever is layered above it — against an in-memory directory rather than a
 stubbed-out search. The fake accepts `paged_size` and ignores it, so paging
-itself is not exercised here; the seam is placed so that the result cap and
-error translation land inside `_search` where these tests already reach.
+itself is not exercised here; the result cap is, being a decision about how
+much of the result generator to consume rather than about page size.
 
 Nothing opens a socket, and no test asserts result order: a real paged_search
 yields each page in reverse.
@@ -13,16 +13,21 @@ yields each page in reverse.
 import logging
 
 from dataclasses import replace
-from typing import cast
 
 import pytest
 
-from ldap3 import Connection
-
 from adsearch.errors import NotFoundError
-from adsearch.search import LDAPSearch
 
-from tests.conftest import ANN, BASE_DN, BO, CY, CONFIG, searcher, searcher_with_connection
+from tests.conftest import (
+    ANN,
+    BASE_DN,
+    BO,
+    CONFIG,
+    CY,
+    searcher,
+    searcher_for,
+    searcher_with_connection,
+)
 from tests.fake_directory import Entry, FakeDirectory, reports_to, user
 
 DI = f"CN=Di Pu,OU=Users,{BASE_DN}"
@@ -194,10 +199,7 @@ def test_a_level_wider_than_the_batch_size_is_split_across_queries():
     level = reports_to(boss, 5, prefix="r", base_dn=BASE_DN)
     child = user(f"CN=Kid,OU=Users,{BASE_DN}", sAMAccountName="kid", manager=level[-1].dn)
     directory = RecordingDirectory(boss, *level, child)
-    ad = LDAPSearch(
-        replace(CONFIG, batch_size=2),
-        connect=lambda _config: cast(Connection, directory.connection()),
-    )
+    ad, _connection = searcher_for(directory, config=replace(CONFIG, batch_size=2))
 
     assert usernames(ad.reporting_tree("alee")) == ["kid", "r0", "r1", "r2", "r3", "r4"]
 
@@ -265,3 +267,61 @@ def test_search_filter_values_are_logged_at_debug_and_nothing_higher(caplog: pyt
     assert caplog.records
     assert any("123" in record.getMessage() for record in caplog.records)
     assert all(record.levelno == logging.DEBUG for record in caplog.records)
+
+
+# --- Resolving stops as soon as it can tell one match from several -----------
+
+
+def twins(count: int, *, username: str = "alee") -> list[Entry]:
+    """`count` entries a site should never have: one username, several users."""
+    return [
+        user(f"CN=Twin {i},OU=Users,{BASE_DN}", sAMAccountName=username)
+        for i in range(count)
+    ]
+
+
+def test_an_ambiguous_resolve_stops_pulling_after_two_entries():
+    """What the search consumed is the only thing separating a cap that stops
+    the generator from one that collects everything and slices (§8.3)."""
+    directory = FakeDirectory(*twins(5))
+    ad, _connection = searcher_for(directory)
+
+    with pytest.raises(NotFoundError):
+        ad.resolve_user_dn("alee")
+
+    assert directory.consumed == 2
+
+
+def test_a_resolve_matching_exactly_one_user_returns_its_dn():
+    ad = searcher(user(ANN, sAMAccountName="alee"), user(BO, sAMAccountName="bng"))
+    assert ad.resolve_user_dn("alee") == ANN
+
+
+def test_a_resolve_matching_nobody_raises():
+    ad = searcher(user(ANN, sAMAccountName="alee"))
+    with pytest.raises(NotFoundError, match="nobody"):
+        ad.resolve_user_dn("nobody")
+
+
+def test_an_ambiguous_resolve_names_the_matches_it_saw():
+    """Never a silent pick: the caller is handed DNs to disambiguate with, and
+    no count, the entries past the second never having been fetched."""
+    entries = twins(5)
+    ad = searcher(*entries)
+
+    with pytest.raises(NotFoundError) as raised:
+        ad.resolve_user_dn("alee")
+
+    named = [entry.dn for entry in entries if entry.dn in str(raised.value)]
+    assert len(named) == 2
+
+
+def test_referrals_do_not_count_against_the_cap():
+    """A cap spent on the raw stream would burn itself on the two referrals and
+    report the ambiguous username as missing."""
+    ad = searcher(
+        *twins(2),
+        referrals=["ldap://a.test.com/DC=a,DC=com", "ldap://b.test.com/DC=b,DC=com"],
+    )
+    with pytest.raises(NotFoundError, match="More than one"):
+        ad.resolve_user_dn("alee")

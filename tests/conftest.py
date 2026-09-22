@@ -40,6 +40,23 @@ def offline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "getaddrinfo", refuse)
 
 
+def searcher_for(
+    directory: FakeDirectory,
+    *,
+    config: LDAPConfig = CONFIG,
+    attrs: AttributeMap = DEFAULT_ATTRIBUTES,
+) -> tuple[LDAPSearch, FakeConnection]:
+    """An `LDAPSearch` over a directory the caller built and keeps, plus the one
+    connection it will bind. Holding the directory is what lets a test ask what
+    a search consumed or which filters it sent.
+
+    The cast is the one lie in this suite: `FakeConnection` implements the
+    slice of ldap3's `Connection` that `adsearch` uses, and nothing else."""
+    connection = directory.connection()
+    ad = LDAPSearch(config, attrs, connect=lambda _config: cast(Connection, connection))
+    return ad, connection
+
+
 def searcher_with_connection(
     *entries: Entry,
     referrals: Sequence[str] = (),
@@ -48,14 +65,9 @@ def searcher_with_connection(
     attrs: AttributeMap = DEFAULT_ATTRIBUTES,
 ) -> tuple[LDAPSearch, FakeConnection]:
     """Like `searcher`, but also hands back the raw fake connection for tests
-    that need to assert on it directly — e.g. that it was unbound on exit.
-
-    The cast is the one lie in this suite: `FakeConnection` implements the
-    slice of ldap3's `Connection` that `adsearch` uses, and nothing else."""
+    that need to assert on it directly — e.g. that it was unbound on exit."""
     directory = FakeDirectory(*entries, referrals=referrals, failure=failure)
-    connection = directory.connection()
-    ad = LDAPSearch(config, attrs, connect=lambda _config: cast(Connection, connection))
-    return ad, connection
+    return searcher_for(directory, config=config, attrs=attrs)
 
 
 def searcher(
