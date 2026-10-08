@@ -20,15 +20,28 @@ class AttributeMap:
     cn: str = "cn"
     employee_id: str = "employeeID"
     username: str = "sAMAccountName"
+    upn: str = "userPrincipalName"
     mail: str = "mail"
     manager: str = "manager"
+    member_of: str = "memberOf"
+    cost_center: str = "departmentNumber"   # Low confidence; override per site (§5.2)
     extra: tuple[str, ...] = ()
 
 
     def fetch_attributes(self) -> list[str]:
         """Every attribute name to request on a search, including extras.
         Remove duplicates from combining main attrs with extras"""
-        attrs = [self.name, self.cn, self.employee_id, self.username, self.mail, self.manager]
+        attrs = [
+            self.name,
+            self.cn,
+            self.employee_id,
+            self.username,
+            self.upn,
+            self.mail,
+            self.manager,
+            self.member_of,
+            self.cost_center,
+        ]
         return list(dict.fromkeys(attrs + list(self.extra)))
 
 

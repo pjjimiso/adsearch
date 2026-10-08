@@ -22,7 +22,7 @@ from typing import Literal
 
 from ldap3 import NO_ATTRIBUTES, SUBTREE
 
-from adsearch.filters import IN_CHAIN
+from adsearch.filters import ACCOUNTDISABLE, BIT_AND, IN_CHAIN
 
 
 def _fold(value: str) -> str:
@@ -109,11 +109,29 @@ class Equal:
 
 
 @dataclass(frozen=True)
+class Contains:
+    attribute: str
+    value: str
+
+    def matches(self, entry: Entry, directory: FakeDirectory) -> bool:
+        wanted = _fold(self.value)
+        return any(wanted in _fold(value) for value in entry.values(self.attribute))
+
+
+@dataclass(frozen=True)
 class Present:
     attribute: str
 
     def matches(self, entry: Entry, directory: FakeDirectory) -> bool:
         return bool(entry.values(self.attribute))
+
+
+@dataclass(frozen=True)
+class Not:
+    clause: Node
+
+    def matches(self, entry: Entry, directory: FakeDirectory) -> bool:
+        return not self.clause.matches(entry, directory)
 
 
 @dataclass(frozen=True)
@@ -123,9 +141,23 @@ class Extensible:
     value: str
 
     def matches(self, entry: Entry, directory: FakeDirectory) -> bool:
-        """LDAP_MATCHING_RULE_IN_CHAIN: follow `attribute` transitively."""
+        if self.oid == BIT_AND:
+            return self._bit_and(entry)
         if self.oid != IN_CHAIN:
             raise FilterSyntaxError(f"unsupported matching rule {self.oid}")
+        return self._in_chain(entry, directory)
+
+    def _bit_and(self, entry: Entry) -> bool:
+        """LDAP_MATCHING_RULE_BIT_AND: the asserted bits are set in `attribute`.
+
+        An absent attribute matches nothing, which is what makes the negated
+        form of this rule pass an entry that carries no account control value
+        at all."""
+        mask = int(self.value)
+        return any(int(value) & mask == mask for value in entry.values(self.attribute))
+
+    def _in_chain(self, entry: Entry, directory: FakeDirectory) -> bool:
+        """LDAP_MATCHING_RULE_IN_CHAIN: follow `attribute` transitively."""
         wanted = _fold(self.value)
         seen: set[str] = set()
         frontier = list(entry.values(self.attribute))
@@ -159,17 +191,16 @@ class Or:
         return any(clause.matches(entry, directory) for clause in self.clauses)
 
 
-Node = And | Or | Equal | Present | Extensible
+Node = And | Or | Not | Equal | Contains | Present | Extensible
 
 
 class _Parser:
     """Recursive descent over the RFC 4515 subset this library emits.
 
-    Covers exactly what `filters.py` emits and nothing more — negation has no
-    branch here because no helper produces one. Relies on one property of the
-    library: every assertion value has passed through `filters.esc`, so a bare
-    `(` or `)` can never appear inside a value and a clause can be read up to
-    the next `)`."""
+    Covers exactly what `filters.py` emits and nothing more. Relies on one
+    property of the library: every assertion value has passed through
+    `filters.esc`, so a bare `(` or `)` can never appear inside a value and a
+    clause can be read up to the next `)`."""
 
     def __init__(self, text: str) -> None:
         self._text = text
@@ -184,6 +215,11 @@ class _Parser:
         if char == "|":
             self._pos += 1
             return Or(tuple(self._clauses()))
+        if char == "!":
+            self._pos += 1
+            negated = Not(self.filter())
+            self._take(")")
+            return negated
         node = self._simple()
         self._take(")")
         return node
@@ -212,11 +248,15 @@ class _Parser:
             name, _, oid = attribute[:-1].partition(":")
             return Extensible(name, oid, unescape(value))
 
-        # Test for presence BEFORE unescaping. A neutralised wildcard is the
+        # Read the wildcards BEFORE unescaping. A neutralised wildcard is the
         # four characters `\2a`; unescaping first would turn it into a presence
         # filter and quietly make every injection test meaningless.
         if value == "*":
             return Present(attribute)
+        if "*" in value:
+            if not (value.startswith("*") and value.endswith("*")):
+                raise FilterSyntaxError(f"unsupported wildcard in clause {body!r}")
+            return Contains(attribute, unescape(value[1:-1]))
         return Equal(attribute, unescape(value))
 
     def _peek(self) -> str:
@@ -239,21 +279,30 @@ def parse(text: str) -> Node:
     return node
 
 
+NORMAL_ACCOUNT = 512
+
+
 def user(
     dn: str,
     *,
     manager: str | None = None,
     member_of: Sequence[str] = (),
+    disabled: bool = False,
     **attributes: str | Sequence[str],
 ) -> Entry:
     """A person entry carrying the object class and category `USER_OBJECT` filters on.
 
     Real Active Directory stores `objectCategory` as a DN and resolves the
     `person` shorthand server-side. The fake stores the shorthand, because the
-    shorthand is what the library's filter actually says."""
+    shorthand is what the library's filter actually says.
+
+    Every user carries a `userAccountControl` value, as a real one does, so
+    that a fixture is enabled or disabled on purpose rather than by omission."""
+    control = NORMAL_ACCOUNT | ACCOUNTDISABLE if disabled else NORMAL_ACCOUNT
     values: dict[str, list[str]] = {
         "objectClass": ["top", "person", "organizationalPerson", "user"],
         "objectCategory": ["person"],
+        "userAccountControl": [str(control)],
     }
     if manager is not None:
         values["manager"] = [manager]
