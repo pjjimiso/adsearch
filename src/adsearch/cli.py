@@ -76,38 +76,38 @@ def main() -> None:
 
 def test_command() -> None:
     config = LDAPConfig.from_env()
-    search = LDAPSearch(config)
-    # who_am_i() is an extended operation issued straight at the connection,
-    # past both of the library's handlers (§6.2).
-    with translated():
-        print(f"bound: {search.conn.bound}")
-        print(f"whoami: {search.conn.extend.standard.who_am_i()}")
+    with LDAPSearch(config) as search:
+        # who_am_i() is an extended operation issued straight at the connection,
+        # past both of the library's handlers (§6.2).
+        with translated():
+            print(f"bound: {search.conn.bound}")
+            print(f"whoami: {search.conn.extend.standard.who_am_i()}")
 
 
 def employee_id_command(id: str) -> list[User]:
     config = LDAPConfig.from_env()
-    search = LDAPSearch(config)
-    return search.find_users(employee_id=id)
+    with LDAPSearch(config) as search:
+        return search.find_users(employee_id=id)
 
 
 def manager_command(username: str, *, all_reports: bool = False) -> list[User]:
     config = LDAPConfig.from_env()
-    search = LDAPSearch(config)
-    if all_reports:
-        return search.reporting_tree(username)
-    return search.direct_reports(username)
+    with LDAPSearch(config) as search:
+        if all_reports:
+            return search.reporting_tree(username)
+        return search.direct_reports(username)
 
 
 def cost_center_command(cost_center: str) -> list[User]:
     config = LDAPConfig.from_env()
-    search = LDAPSearch(config)
-    return search.find_users(cost_center=cost_center)
+    with LDAPSearch(config) as search:
+        return search.find_users(cost_center=cost_center)
 
 
 def group_command(group: str, *, transitive: bool = True) -> list[User]:
     config = LDAPConfig.from_env()
-    search = LDAPSearch(config)
-    return search.by_group(group, transitive=transitive)
+    with LDAPSearch(config) as search:
+        return search.by_group(group, transitive=transitive)
 
 
 _COLUMNS = ("username", "dn", "name", "employee_id", "email")

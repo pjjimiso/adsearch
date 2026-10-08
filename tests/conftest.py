@@ -17,6 +17,17 @@ from tests.fake_directory import Entry, FakeConnection, FakeDirectory, Failure
 BASE_DN = "DC=test,DC=com"
 CONFIG = LDAPConfig(server="ldaps://dc.test.com", base_dn=BASE_DN)
 
+
+class NullContext:
+    """`__enter__`/`__exit__` that do nothing, for a hand-rolled fake standing
+    in for `LDAPSearch` in a CLI test."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        pass
+
 ANN = f"CN=Ann Lee,OU=Users,{BASE_DN}"
 BO = f"CN=Bo Ng,OU=Users,{BASE_DN}"
 CY = f"CN=Cy Oh,OU=Users,{BASE_DN}"

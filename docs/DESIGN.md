@@ -831,6 +831,11 @@ it is the only way to see what the directory is actually returning.
 `main()` contains exactly **one** top-level `try`, catching `LDAPSearchError` and mapping exception
 type to the exit code in §6.4. `str(exc)` goes to stderr; the traceback appears only under `--debug`.
 
+Every subcommand opens its `LDAPSearch` with the `with` block from §4.2 and does its work inside it,
+`test` included: bind state and identity are read off the connection before it closes, never after.
+The connection releases on the way out whether the block returns or raises, so a failing command
+still unbinds instead of leaving the domain controller to notice at garbage collection (§8.1).
+
 Output format is decided in exactly one place:
 
 ```python
