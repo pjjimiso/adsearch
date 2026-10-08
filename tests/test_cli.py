@@ -26,7 +26,7 @@ import pytest
 from ldap3.core.exceptions import LDAPInvalidFilterError
 
 from adsearch import cli
-from adsearch.cli import build_parser, format_users, render_reports
+from adsearch.cli import build_parser, format_raw, format_users, render_reports, render_users
 from adsearch.errors import (
     LDAPAuthError,
     LDAPConfigError,
@@ -35,7 +35,7 @@ from adsearch.errors import (
     LDAPSearchError,
     NotFoundError,
 )
-from adsearch.models import User
+from adsearch.models import DEFAULT_ATTRIBUTES, User
 
 from tests.conftest import NullContext, searcher_with_connection
 from tests.fake_directory import Failure
@@ -101,11 +101,11 @@ def test_the_flag_chooses_which_library_operation_is_called(monkeypatch: pytest.
         def __init__(self, config, *args, **kwargs) -> None:
             pass
 
-        def direct_reports(self, username: str) -> list[User]:
+        def direct_reports(self, username: str, *, attributes=None) -> list[User]:
             called.append(("direct_reports", username))
             return []
 
-        def reporting_tree(self, username: str) -> list[User]:
+        def reporting_tree(self, username: str, *, attributes=None) -> list[User]:
             called.append(("reporting_tree", username))
             return []
 
@@ -143,7 +143,10 @@ def test_the_no_transitive_flag_reaches_the_library(monkeypatch: pytest.MonkeyPa
         def __init__(self, config, *args, **kwargs) -> None:
             pass
 
-        def by_group(self, group: str, *, transitive: bool = True) -> list[User]:
+        def by_group(
+            self, group: str, *, transitive: bool = True, include_disabled: bool = False,
+            attributes=None,
+        ) -> list[User]:
             called.append((group, transitive))
             return []
 
@@ -179,7 +182,7 @@ def test_the_cost_center_subcommand_names_no_attribute(monkeypatch: pytest.Monke
 
     cli.cost_center_command("1234")
 
-    assert called == [{"cost_center": "1234"}]
+    assert called == [{"cost_center": "1234", "include_disabled": False, "attributes": None}]
 
 
 def test_a_command_releases_its_connection_on_success(monkeypatch: pytest.MonkeyPatch):
@@ -222,45 +225,39 @@ def test_a_command_still_releases_its_connection_when_the_search_fails(
     assert connection.bound is False
 
 
-def test_the_test_subcommand_releases_its_connection_too(monkeypatch: pytest.MonkeyPatch):
-    """`test_command` reads bind state and identity off the connection before
-    the block closes (§10), but it still has to close like every other
-    subcommand (issue #15). `who_am_i()` sits outside the fake-connection seam
-    (§6.2's "third place the library reaches the network"), so this fake tracks
-    release directly instead."""
-
-    class Conn:
-        bound = True
-
-        class extend:
-            class standard:
-                @staticmethod
-                def who_am_i() -> str:
-                    return "u:test"
+def test_the_server_info_subcommand_releases_its_connection_too(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """`server_info` runs over its own throwaway connection, never `conn`
+    (§9), but the CLI's `with` block still has to close the `LDAPSearch`
+    instance like every other subcommand (issue #15)."""
 
     class Bound(NullContext):
         def __init__(self, config, *args, **kwargs) -> None:
-            self.conn = Conn()
             self.closed = False
 
         def __exit__(self, *exc_info) -> None:
             self.closed = True
 
+        def server_info(self) -> str:
+            return "naming contexts: DC=test,DC=com"
+
     configured_env(monkeypatch)
     fake_search = Bound(None)
     monkeypatch.setattr(cli, "LDAPSearch", lambda config: fake_search)
 
-    cli.test_command()
-
+    assert cli.server_info_command() == "naming contexts: DC=test,DC=com"
     assert fake_search.closed is True
 
 
 SUBCOMMANDS = [
-    ("test",),
+    ("server-info",),
     ("employee", "123"),
     ("manager", "jdoe"),
     ("cost-center", "1234"),
     ("group", "Engineers"),
+    ("describe", "--username", "jdoe"),
+    ("resolve-dn", "--username", "jdoe"),
 ]
 
 DOCUMENTED_CODES = [
@@ -282,7 +279,7 @@ def carrying(attributes: dict[str, object]) -> User:
 def failing_command(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
     """Make `employee` raise where a real one would, opening no connection."""
 
-    def raise_it(_id: str) -> list[User]:
+    def raise_it(_id: str, **_kwargs: object) -> list[User]:
         raise error
 
     monkeypatch.setattr(cli, "employee_id_command", raise_it)
@@ -357,7 +354,7 @@ def test_a_failing_command_reports_its_code_and_still_releases_the_connection(
 def test_success_exits_zero(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
-    monkeypatch.setattr(cli, "employee_id_command", lambda _id: [bo()])
+    monkeypatch.setattr(cli, "employee_id_command", lambda _id, **_kwargs: [bo()])
     assert cli.main(["employee", "123"]) == cli.EXIT_OK
     assert "bng" in capsys.readouterr().out
 
@@ -577,3 +574,313 @@ def test_the_report_renderer_delegates_the_format_decision(
     monkeypatch.setattr(cli, "format_users", recorder)
     render_reports([bo()], "csv")
     assert seen == ["csv"]
+
+
+# --- Discovery flags: --raw, --attributes, --include-disabled, --insecure ---
+
+
+def test_the_raw_flag_defaults_to_false():
+    assert parse("employee", "123").raw is False
+
+
+def test_the_raw_flag_parses_on_every_search_subcommand():
+    assert parse("employee", "123", "--raw").raw is True
+    assert parse("manager", "jdoe", "--raw").raw is True
+    assert parse("cost-center", "1234", "--raw").raw is True
+    assert parse("group", "Engineers", "--raw").raw is True
+
+
+def test_the_attributes_flag_parses_a_comma_separated_list():
+    assert parse("employee", "123", "--attributes", "a,b,c").attributes == ["a", "b", "c"]
+
+
+def test_the_attributes_flag_trims_whitespace_around_each_name():
+    assert parse("employee", "123", "--attributes", "a, b , c").attributes == ["a", "b", "c"]
+
+
+def test_the_attributes_flag_defaults_to_none():
+    """`None` and not `[]`: DESIGN §8.5 says `attributes=None` keeps the
+    attribute map's own fetch list, which an empty list would also do, but
+    only `None` says so — the two are not the same promise to the library."""
+    assert parse("employee", "123").attributes is None
+
+
+def test_the_include_disabled_flag_defaults_to_false():
+    assert parse("employee", "123").include_disabled is False
+
+
+def test_the_include_disabled_flag_parses_on_employee_cost_center_and_group():
+    assert parse("employee", "123", "--include-disabled").include_disabled is True
+    assert parse("cost-center", "1234", "--include-disabled").include_disabled is True
+    assert parse("group", "Engineers", "--include-disabled").include_disabled is True
+
+
+def test_manager_has_no_include_disabled_flag():
+    """DESIGN §8.5: `direct_reports`/`reporting_tree` have no criterion to opt
+    out with, so the subcommand does not offer a flag the library can't take."""
+    with pytest.raises(SystemExit):
+        parse("manager", "jdoe", "--include-disabled")
+
+
+@pytest.mark.parametrize("argv", SUBCOMMANDS, ids=lambda argv: argv[0])
+def test_every_subcommand_accepts_the_insecure_flag(argv: tuple[str, ...]):
+    assert parse(*argv).insecure is False
+    assert parse(*argv, "--insecure").insecure is True
+
+
+@pytest.mark.parametrize("argv", SUBCOMMANDS, ids=lambda argv: argv[0])
+def test_insecure_is_accepted_before_the_subcommand_too(argv: tuple[str, ...]):
+    assert parse("--insecure", *argv).insecure is True
+
+
+def test_insecure_is_answerable_even_with_no_subcommand():
+    assert parse().insecure is False
+    assert parse("--insecure").insecure is True
+
+
+def test_the_attributes_flag_reaches_the_library(monkeypatch: pytest.MonkeyPatch):
+    called: list[dict[str, object]] = []
+
+    class Recorder(NullContext):
+        def __init__(self, config, *args, **kwargs) -> None:
+            pass
+
+        def find_users(self, **criteria: object) -> list[User]:
+            called.append(criteria)
+            return []
+
+    configured_env(monkeypatch)
+    monkeypatch.setattr(cli, "LDAPSearch", Recorder)
+
+    cli.employee_id_command("123", attributes=["extensionAttribute7"])
+
+    assert called == [
+        {
+            "employee_id": "123",
+            "include_disabled": False,
+            "attributes": ["extensionAttribute7"],
+        }
+    ]
+
+
+def test_render_users_switches_between_mapped_and_raw_output():
+    mapped = render_users([bo()], "json", raw=False)
+    assert json.loads(mapped)[0]["username"] == "bng"
+
+    raw = render_users([carrying({"objectGUID": "opaque"})], "json", raw=True)
+    assert json.loads(raw) == [{"dn": bo()["dn"], "objectGUID": "opaque"}]
+
+
+def test_format_raw_bypasses_the_user_mapper():
+    """DESIGN §10: the DN plus every attribute as the directory returned it —
+    none of the curated name/employee_id/username/email fields."""
+    user = carrying({"sAMAccountName": ["bng"], "whenCreated": "2026-03-01T00:00:00"})
+    entries = json.loads(format_raw([user]))
+    assert entries == [
+        {
+            "dn": user["dn"],
+            "sAMAccountName": ["bng"],
+            "whenCreated": "2026-03-01T00:00:00",
+        }
+    ]
+
+
+def test_raw_output_is_always_json_regardless_of_the_format_flag():
+    user = carrying({"sAMAccountName": ["bng"]})
+    assert render_users([user], "table", raw=True) == render_users([user], "csv", raw=True)
+
+
+def test_the_raw_flag_reaches_rendering(monkeypatch: pytest.MonkeyPatch):
+    """Through `main`, so the wiring from parsed flag to renderer is covered
+    end to end rather than asserted on `render_users` alone."""
+    monkeypatch.setattr(
+        cli, "employee_id_command", lambda _id, **_kwargs: [carrying({"objectGUID": "opaque"})]
+    )
+    captured_main = cli.main(["employee", "123", "--raw"])
+    assert captured_main == cli.EXIT_OK
+
+
+def test_insecure_reaches_build_config(monkeypatch: pytest.MonkeyPatch):
+    seen: list[bool] = []
+
+    def recorder(*, insecure: bool = False):
+        seen.append(insecure)
+        return cli.LDAPConfig(server="ldaps://dc.test.com", base_dn="DC=test,DC=com")
+
+    class Bound(NullContext):
+        def server_info(self) -> str:
+            return "info"
+
+    monkeypatch.setattr(cli, "build_config", recorder)
+    monkeypatch.setattr(cli, "LDAPSearch", lambda config: Bound())
+
+    cli.server_info_command(insecure=True)
+
+    assert seen == [True]
+
+
+def test_build_config_turns_off_certificate_validation_when_insecure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """DESIGN §7.3: `--insecure` is the one path that can produce `CERT_NONE`,
+    and it goes through `LDAPConfig`'s own flag rather than a parallel one."""
+    configured_env(monkeypatch)
+    assert cli.build_config().validate_cert is True
+    assert cli.build_config(insecure=True).validate_cert is False
+
+
+# --- describe and resolve-dn (DESIGN §9, §8.6) -------------------------------
+
+
+def test_describe_requires_exactly_one_selector():
+    with pytest.raises(SystemExit):
+        parse("describe")
+    with pytest.raises(SystemExit):
+        parse("describe", "--username", "jdoe", "--employee-id", "123")
+
+
+def test_describe_parses_either_selector():
+    assert parse("describe", "--username", "jdoe").username == "jdoe"
+    assert parse("describe", "--employee-id", "123").employee_id == "123"
+
+
+def test_resolve_dn_requires_exactly_one_selector():
+    with pytest.raises(SystemExit):
+        parse("resolve-dn")
+    with pytest.raises(SystemExit):
+        parse("resolve-dn", "--username", "jdoe", "--group", "Engineers")
+
+
+def test_resolve_dn_parses_any_of_its_three_selectors():
+    assert parse("resolve-dn", "--username", "jdoe").username == "jdoe"
+    assert parse("resolve-dn", "--employee-id", "123").employee_id == "123"
+    assert parse("resolve-dn", "--group", "Engineers").group == "Engineers"
+
+
+def test_describe_by_username_reaches_describe_user_with_the_librarys_own_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    called: list[tuple[str, str | None]] = []
+
+    class Recorder(NullContext):
+        def __init__(self, config, *args, **kwargs) -> None:
+            pass
+
+        def describe_user(self, value: str, *, by: str = "sAMAccountName") -> dict[str, object]:
+            called.append((value, by))
+            return {"dn": "CN=jdoe"}
+
+    configured_env(monkeypatch)
+    monkeypatch.setattr(cli, "LDAPSearch", Recorder)
+
+    cli.describe_command(username="jdoe")
+
+    assert called == [("jdoe", "sAMAccountName")]
+
+
+def test_describe_by_employee_id_passes_the_attribute_maps_employee_id_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    called: list[tuple[str, str]] = []
+
+    class Recorder(NullContext):
+        def __init__(self, config, *args, **kwargs) -> None:
+            pass
+
+        def describe_user(self, value: str, *, by: str = "sAMAccountName") -> dict[str, object]:
+            called.append((value, by))
+            return {"dn": "CN=jdoe"}
+
+    configured_env(monkeypatch)
+    monkeypatch.setattr(cli, "LDAPSearch", Recorder)
+
+    cli.describe_command(employee_id="123")
+
+    assert called == [("123", DEFAULT_ATTRIBUTES.employee_id)]
+
+
+def test_resolve_dn_by_group_calls_resolve_group_dn(monkeypatch: pytest.MonkeyPatch):
+    called: list[str] = []
+
+    class Recorder(NullContext):
+        def __init__(self, config, *args, **kwargs) -> None:
+            pass
+
+        def resolve_group_dn(self, group: str) -> str:
+            called.append(group)
+            return "CN=Engineers"
+
+    configured_env(monkeypatch)
+    monkeypatch.setattr(cli, "LDAPSearch", Recorder)
+
+    assert cli.resolve_dn_command(group="Engineers") == "CN=Engineers"
+    assert called == ["Engineers"]
+
+
+def test_resolve_dn_by_username_calls_resolve_user_dn_with_no_by_override(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    called: list[tuple[str, str | None]] = []
+
+    class Recorder(NullContext):
+        def __init__(self, config, *args, **kwargs) -> None:
+            pass
+
+        def resolve_user_dn(self, value: str, *, by: str | None = None) -> str:
+            called.append((value, by))
+            return "CN=jdoe"
+
+    configured_env(monkeypatch)
+    monkeypatch.setattr(cli, "LDAPSearch", Recorder)
+
+    cli.resolve_dn_command(username="jdoe")
+
+    assert called == [("jdoe", None)]
+
+
+def test_resolve_dn_by_employee_id_passes_the_attribute_maps_employee_id_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    called: list[tuple[str, str | None]] = []
+
+    class Recorder(NullContext):
+        def __init__(self, config, *args, **kwargs) -> None:
+            pass
+
+        def resolve_user_dn(self, value: str, *, by: str | None = None) -> str:
+            called.append((value, by))
+            return "CN=jdoe"
+
+    configured_env(monkeypatch)
+    monkeypatch.setattr(cli, "LDAPSearch", Recorder)
+
+    cli.resolve_dn_command(employee_id="123")
+
+    assert called == [("123", DEFAULT_ATTRIBUTES.employee_id)]
+
+
+def test_describe_dispatches_through_main(monkeypatch: pytest.MonkeyPatch, capsys):
+    monkeypatch.setattr(cli, "describe_command", lambda **_kwargs: {"dn": "CN=jdoe"})
+    assert cli.main(["describe", "--username", "jdoe"]) == cli.EXIT_OK
+    assert json.loads(capsys.readouterr().out) == {"dn": "CN=jdoe"}
+
+
+def test_resolve_dn_dispatches_through_main(monkeypatch: pytest.MonkeyPatch, capsys):
+    monkeypatch.setattr(cli, "resolve_dn_command", lambda **_kwargs: "CN=jdoe")
+    assert cli.main(["resolve-dn", "--username", "jdoe"]) == cli.EXIT_OK
+    assert capsys.readouterr().out.strip() == "CN=jdoe"
+
+
+def test_server_info_dispatches_through_main(monkeypatch: pytest.MonkeyPatch, capsys):
+    monkeypatch.setattr(cli, "server_info_command", lambda **_kwargs: "naming contexts: ...")
+    assert cli.main(["server-info"]) == cli.EXIT_OK
+    assert capsys.readouterr().out.strip() == "naming contexts: ..."
+
+
+def test_describe_and_resolve_dn_raise_the_documented_notfound_code(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        cli, "describe_command", lambda **_kwargs: (_ for _ in ()).throw(NotFoundError("nope"))
+    )
+    assert cli.main(["describe", "--username", "nobody"]) == dict(DOCUMENTED_CODES)[NotFoundError]

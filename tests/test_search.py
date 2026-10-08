@@ -13,11 +13,15 @@ yields each page in reverse.
 import logging
 
 from dataclasses import replace
+from typing import cast
 
 import pytest
 
+from ldap3 import Connection
+
 from adsearch.errors import LDAPQueryError, NotFoundError
 from adsearch.models import AttributeMap
+from adsearch.search import LDAPSearch
 
 from tests.conftest import (
     ANN,
@@ -695,3 +699,115 @@ def test_an_enumeration_does_not_pick_up_a_same_named_group_elsewhere():
     )
     scoped = replace(CONFIG, group_base_dn=GROUP_BASE)
     assert usernames(searcher(*entries, config=scoped).by_group("Engineers")) == ["alee"]
+
+
+# --- Schema discovery (DESIGN §9) --------------------------------------------
+
+
+class FakeSchemaConnection:
+    """Stands in for the throwaway `get_info=ALL` connection `server_info`
+    opens — a different shape than `FakeConnection`, since it is never asked
+    to search."""
+
+    def __init__(self, info: str) -> None:
+        self.server = type("Server", (), {"info": info})()
+        self.unbound = False
+
+    def unbind(self) -> None:
+        self.unbound = True
+
+
+def test_server_info_never_touches_the_main_connection_seam():
+    """DESIGN §9: schema information is pulled on its own throwaway
+    connection, never on an ordinary bind. Proven by never giving the main
+    `connect` factory a chance to run."""
+
+    def refuse(_config):
+        raise AssertionError("server_info reached the main connection seam")
+
+    schema_conn = FakeSchemaConnection("namingContexts: DC=test,DC=com")
+    ad = LDAPSearch(
+        CONFIG, connect=refuse, schema_connect=lambda _config: cast(Connection, schema_conn)
+    )
+
+    assert ad.server_info() == "namingContexts: DC=test,DC=com"
+
+
+def test_server_info_releases_its_throwaway_connection():
+    schema_conn = FakeSchemaConnection("info")
+    ad = LDAPSearch(CONFIG, schema_connect=lambda _config: cast(Connection, schema_conn))
+
+    ad.server_info()
+
+    assert schema_conn.unbound is True
+
+
+def test_describe_user_dumps_every_populated_attribute():
+    ad = searcher(
+        user(ANN, sAMAccountName="alee", displayName="Ann Lee", extensionAttribute7="WIDGETS")
+    )
+    described = ad.describe_user("alee", by="sAMAccountName")
+    assert described["dn"] == ANN
+    assert described["displayName"] == ["Ann Lee"]
+    assert described["extensionAttribute7"] == ["WIDGETS"]
+
+
+def test_describe_user_defaults_to_username_as_the_bootstrapping_key():
+    """DESIGN §9: `sAMAccountName` is reliable everywhere, which is what lets
+    discovery run before a real `AttributeMap` is known."""
+    ad = searcher(user(ANN, sAMAccountName="alee"))
+    assert ad.describe_user("alee")["dn"] == ANN
+
+
+def test_describe_user_raises_when_nobody_matches():
+    ad = searcher(user(ANN, sAMAccountName="alee"))
+    with pytest.raises(NotFoundError):
+        ad.describe_user("nobody")
+
+
+def test_describe_user_raises_rather_than_picking_one_of_several_matches():
+    """`by` can point at a one-to-many attribute such as an employee ID
+    (CONTEXT.md). A silent pick here would show one person's attributes
+    labelled as another's, so this follows the same resolve-style rule as
+    `resolve_user_dn` (§6.3) rather than returning whichever came first."""
+    ad = searcher(
+        user(ANN, sAMAccountName="alee", employeeID="123"),
+        user(BO, sAMAccountName="bng", employeeID="123"),
+    )
+    with pytest.raises(NotFoundError, match="More than one"):
+        ad.describe_user("123", by="employeeID")
+
+
+def test_describe_user_validates_the_by_attribute_name():
+    ad = searcher(user(ANN, sAMAccountName="alee"))
+    with pytest.raises(LDAPQueryError):
+        ad.describe_user("alee", by="sAMAccountName)(objectClass=*")
+
+
+def test_an_attributes_request_reaches_a_group_search():
+    ad = searcher(
+        group(GROUP),
+        user(ANN, sAMAccountName="alee", member_of=[GROUP], extensionAttribute7="WIDGETS"),
+    )
+    found = ad.by_group("Engineers", attributes=["extensionAttribute7"])
+    assert found[0]["attributes"]["extensionAttribute7"] == ["WIDGETS"]
+
+
+def test_an_attributes_request_reaches_a_manager_search():
+    ad = searcher(
+        user(ANN, sAMAccountName="alee"),
+        user(BO, sAMAccountName="bng", manager=ANN, extensionAttribute7="WIDGETS"),
+    )
+    found = ad.direct_reports("alee", attributes=["extensionAttribute7"])
+    assert found[0]["attributes"]["extensionAttribute7"] == ["WIDGETS"]
+
+
+def test_an_attributes_request_reaches_every_level_of_a_reporting_tree():
+    ad = searcher(
+        user(ANN, sAMAccountName="alee"),
+        user(BO, sAMAccountName="bng", manager=ANN, extensionAttribute7="L1"),
+        user(CY, sAMAccountName="coh", manager=BO, extensionAttribute7="L2"),
+    )
+    found = {u["username"]: u for u in ad.reporting_tree("alee", attributes=["extensionAttribute7"])}
+    assert found["bng"]["attributes"]["extensionAttribute7"] == ["L1"]
+    assert found["coh"]["attributes"]["extensionAttribute7"] == ["L2"]

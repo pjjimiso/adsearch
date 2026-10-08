@@ -20,7 +20,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
-from ldap3 import NO_ATTRIBUTES, SUBTREE
+from ldap3 import ALL_ATTRIBUTES, ALL_OPERATIONAL_ATTRIBUTES, NO_ATTRIBUTES, SUBTREE
 from ldap3.utils.dn import parse_dn
 
 from adsearch.filters import ACCOUNTDISABLE, BIT_AND, IN_CHAIN
@@ -76,9 +76,13 @@ class Entry:
 
         Unpopulated attributes are omitted, which is what a real DC does and
         what keeps `to_user`'s displayName -> cn -> dn fallback reachable in a
-        test."""
+        test. `ALL_ATTRIBUTES`/`ALL_OPERATIONAL_ATTRIBUTES` are the sentinels
+        `describe_user` asks for (§9); the fake does not model operational
+        attributes separately, so either one expands to everything populated."""
         if attributes is None or NO_ATTRIBUTES in attributes:
             return {}
+        if ALL_ATTRIBUTES in attributes or ALL_OPERATIONAL_ATTRIBUTES in attributes:
+            return dict(self.attributes)
         projected: dict[str, list[str]] = {}
         for name in attributes:
             values = self.values(name)
@@ -414,12 +418,25 @@ class _Extend:
         self.standard = _Standard(directory)
 
 
+class _FakeServerInfo:
+    """Stands in for `Server.info` where a test does not care what it says."""
+
+    def __str__(self) -> str:
+        return "fake server info"
+
+
+class _FakeServer:
+    def __init__(self) -> None:
+        self.info = _FakeServerInfo()
+
+
 class FakeConnection:
     """The slice of ldap3's Connection that `adsearch` actually uses."""
 
     def __init__(self, directory: FakeDirectory) -> None:
         self.extend = _Extend(directory)
         self.bound = True
+        self.server = _FakeServer()
 
     def unbind(self) -> None:
         self.bound = False
