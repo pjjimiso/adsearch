@@ -394,18 +394,20 @@ a locked-out account, `data 532` an expired password — and discarding it makes
 nearly undiagnosable. Carrying it both ways means neither `str(e)` nor `e.__cause__` is a dead end.
 
 **Where it lives.** `search.translated()` is a context manager wrapping blocks, applied at exactly the
-two points this library reaches the network: the `conn` property, the only place a bind occurs, and
-`_search`, the only place a query occurs. Two handlers rather than one per method, and a query method
-added later cannot forget to translate because there is no other route out.
+three points this library reaches the network: the `conn` property, the only place an ordinary bind
+occurs; `_search`, the only place a query occurs; and `server_info`'s own throwaway connection (§9).
+Three handlers rather than one per method, and a query method added later cannot forget to translate
+because there is no other route out.
 
 It wraps a block rather than decorating a method for one reason: `paged_search` returns a generator,
 so a size limit or a session the DC drops arrives while `_search` is *consuming* results, not when it
 calls. The result loop is therefore inside the handler. Leaving it outside would return the entries
 that did arrive — an incomplete answer wearing the shape of a complete one (§8.3).
 
-`cli.py`'s `test` subcommand issues `who_am_i()` straight at the connection, past both handlers, and
-wraps that call in `translated()` itself. It is the one command whose entire job is to surface a bad
-bind, so it is the last place a raw `ldap3` exception should appear.
+`cli.py`'s `server-info` subcommand calls `server_info()` and nothing else — it no longer issues a raw
+`ldap3` call of its own. `server_info` translates its own throwaway bind, so the CLI has no bind-level
+exception left to surface raw; it is still the first command worth running against a new deployment,
+because a rejected bind fails here before any query semantics are in question.
 
 **`close()` is deliberately outside it.** Teardown is the one path where translating would do harm:
 §8.1 requires `close()` to *swallow* a failed unbind, because an exception raised from `__exit__`
@@ -810,6 +812,12 @@ requires already knowing the employee-ID attribute name — the exact thing disc
 The default is `sAMAccountName`, reliably standard everywhere, and `by` is overridable once the real
 name is known. It is validated through `filters.attr()`.
 
+**"One known user" is enforced, not assumed.** `describe_user` raises `NotFoundError` on zero matches
+and on more than one, sharing the resolve helper of §8.6 rather than taking the first result `by`
+happens to return. `by` pointed at a one-to-many attribute — an employee ID, say — makes a silent pick
+a live risk: it would show one person's attributes labelled as the one asked for, which is a worse
+failure than refusing to guess (§6.3).
+
 `server_info` uses a throwaway `get_info=ALL` connection and reports naming contexts and supported
 controls. It is the first thing to run against a new deployment, because it proves bind and TLS work
 before any query semantics are involved — which is the main justification for shipping a CLI at all.
@@ -833,10 +841,28 @@ found beneath the rendered result, which is what tells an operator a short answe
 map's answer, not a CLI flag (§5.2). Its own help text says the default is low confidence, because
 the operator reading it is the person who can check.
 
-`--raw` emits the unmapped `ldap3` dict as JSON, bypassing the `User` mapper. During schema discovery
-it is the only way to see what the directory is actually returning.
+`--raw` emits the unmapped `ldap3` dict as JSON, bypassing the `User` mapper — always JSON regardless
+of `--table`/`--csv`/`--json`, since a raw attribute set varies per user and has no fixed columns to
+render as either. During schema discovery it is the only way to see what the directory is actually
+returning, on any of the four search subcommands.
 
 `--attributes` values are validated through `filters.attr()` before reaching a search (§7.2, point 3).
+`--include-disabled` is offered on `employee`, `cost-center` and `group`, which compose into
+`find_users` and so have a criterion to opt out with; `manager` does not, for the reason §8.5 gives
+`direct_reports`/`reporting_tree` no such parameter — the CLI does not offer a flag the library has
+nowhere to take.
+
+`describe` and `resolve-dn` each take exactly one selector from a required, mutually exclusive group
+— `--username`, `--employee-id`, and, for `resolve-dn` only, `--group` — rather than a positional
+value, since which attribute the value names would otherwise be ambiguous. `--username` and
+`--employee-id` resolve through the library's own default guesses (`sAMAccountName`, `employeeID`)
+rather than a custom `AttributeMap`, which the CLI has no way to take in — consistent with discovery
+running *before* one is confirmed correct. Pointing `resolve-dn --employee-id` at a one-to-many
+attribute is allowed on purpose; §8.6 is why that usually raises `NotFoundError` rather than silently
+picking one.
+
+`--insecure` is `LDAPConfig.validate_cert=False` (§7.3) applied after `from_env`, there being no
+environment variable for it — the one flag that reaches a library parameter `from_env` does not.
 
 `main()` contains exactly **one** top-level `try`, with a single `except Exception` arm, and
 `exit_code_for` does the classifying: it walks the exception's MRO against the §6.4 map, so a
@@ -868,9 +894,10 @@ back to `False`. The format flags are inherited by the subparsers only, so they 
 the subcommand.
 
 Every subcommand opens its `LDAPSearch` with the `with` block from §4.2 and does its work inside it,
-`test` included: bind state and identity are read off the connection before it closes, never after.
-The connection releases on the way out whether the block returns or raises, so a failing command
-still unbinds instead of leaving the domain controller to notice at garbage collection (§8.1).
+`server-info` included, even though that command's own work runs over a separate throwaway connection
+(§9) and leaves the block's own connection unopened. The connection releases on the way out whether
+the block returns or raises, so a failing command still unbinds instead of leaving the domain
+controller to notice at garbage collection (§8.1).
 
 Output format is decided in exactly one place:
 
@@ -939,7 +966,7 @@ rather than `Any`.
 | Seaming the test suite at the internal search | Seaming at the connection property | Paging lives in the internal search, and the result cap and error translation are specified to land there too; faking it would put all three beyond reach of a test (§8.1) |
 | A fake keyed on expected filter strings | An in-memory directory with a filter matcher | The reporting-tree walk batches manager DNs into disjunctions whose text depends on `batch_size`; no hand-maintained expected filter survives a level wider than one batch (§8.7) |
 | `ldap3`'s own `MOCK_SYNC` strategy | A hand-written fake directory | `MOCK_SYNC` raises `LDAPDefinitionError` on extensible match — exactly the matching rule transitive group membership needs (§8.8) |
-| A `try`/`except` per public method | Two handlers, at the bind and at the query | Per-method translation is a rule a new method can forget; the two network sites are the only routes out (§6.2) |
+| A `try`/`except` per public method | Three handlers, at the bind, at the query, and at `server_info`'s throwaway bind | Per-method translation is a rule a new method can forget; the three network sites are the only routes out (§6.2) |
 | A decorator on `_search` | A context manager wrapping the call *and* the result loop | Equivalent only while `_search` happens to consume the generator itself, and nothing would keep that true (§6.2) |
 | Translating in `errors.py` | Translating in `search.py` | `errors.py` imports nothing, which is what keeps exit codes and `ldap3` both out of it (§3.2, §6.4) |
 | Naming socket exceptions one at a time | Catching `LDAPCommunicationError`, the family | Three named members left a failed send and a response timeout arriving as query errors — the exact distinction §6.1 exists to draw (§6.2) |

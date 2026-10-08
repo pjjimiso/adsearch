@@ -4,10 +4,14 @@ import ssl
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from itertools import batched, islice
+from typing import Literal
 
 from ldap3 import (
-    SIMPLE, 
+    SIMPLE,
     NONE,
+    ALL,
+    ALL_ATTRIBUTES,
+    ALL_OPERATIONAL_ATTRIBUTES,
     AUTO_BIND_NO_TLS,
     SUBTREE,
     NO_ATTRIBUTES,
@@ -62,6 +66,7 @@ from adsearch.filters import (
 logger = logging.getLogger(__name__)
 
 ConnectionFactory = Callable[[LDAPConfig], Connection]
+GetInfo = Literal["NO_INFO", "DSA", "SCHEMA", "ALL"]
 
 
 AUTH_ERRORS = (LDAPBindError, LDAPInvalidCredentialsResult)
@@ -109,12 +114,15 @@ def translated(fallback: type[LDAPSearchError] = LDAPQueryError) -> Iterator[Non
         raise fallback(str(exc)) from exc
 
 
-def build_server(config: LDAPConfig) -> Server:
+def build_server(config: LDAPConfig, *, get_info: GetInfo = NONE) -> Server:
     """The transport configuration, assembled without opening anything.
 
     `Server` resolves addresses at open time rather than at construction, which
-    is what makes this callable offline and the certificate invariant assertable 
-    without a socket."""
+    is what makes this callable offline and the certificate invariant assertable
+    without a socket.
+
+    `get_info` defaults to `NONE`: `ALL` pulls the entire AD schema on every
+    bind, so only `server_info`'s throwaway connection asks for it (§8.2)."""
     if config.validate_cert:
         cert_validation = ssl.CERT_REQUIRED
     else:
@@ -128,15 +136,24 @@ def build_server(config: LDAPConfig) -> Server:
         host = config.server,
         use_ssl = config.use_ssl,
         tls = tls,
-        get_info = NONE,
+        get_info = get_info,
         connect_timeout = config.connect_timeout,
     )
 
 
-def open_connection(config: LDAPConfig) -> Connection:
+def _unbind_quietly(conn: Connection) -> None:
+    """Swallow a failed unbind during teardown (§8.1): an exception escaping
+    here would replace whatever was already propagating out of the caller."""
+    try:
+        conn.unbind()
+    except Exception:
+        pass
+
+
+def open_connection(config: LDAPConfig, *, get_info: GetInfo = NONE) -> Connection:
     """Build and bind a connection. The only place this library opens a socket."""
     return Connection(
-        build_server(config),
+        build_server(config, get_info=get_info),
         user = config.bind_user,
         password = config.bind_password,
         authentication = SIMPLE,
@@ -155,11 +172,20 @@ class LDAPSearch:
         attrs: AttributeMap = DEFAULT_ATTRIBUTES,
         *,
         connect: ConnectionFactory | None = None,
+        schema_connect: ConnectionFactory | None = None,
     ) -> None:
         self._conn: Connection | None = None
         self._config = config
         self._attrs = attrs
         self._connect: ConnectionFactory = open_connection if connect is None else connect
+        # A second, independent substitution point for §9's throwaway
+        # `get_info=ALL` connection, so pulling the schema can never happen
+        # over the same connection an ordinary bind opens.
+        self._schema_connect: ConnectionFactory = (
+            (lambda cfg: open_connection(cfg, get_info=ALL))
+            if schema_connect is None
+            else schema_connect
+        )
 
 
     @property
@@ -184,10 +210,7 @@ class LDAPSearch:
         real failure (§8.1)."""
         if self._conn is not None:
             conn, self._conn = self._conn, None
-            try:
-                conn.unbind()
-            except Exception:
-                pass
+            _unbind_quietly(conn)
 
 
     def __enter__(self) -> "LDAPSearch":
@@ -323,6 +346,31 @@ class LDAPSearch:
         )
 
 
+    def _find_one(
+        self,
+        search_filter: str,
+        attributes: Sequence[str],
+        *,
+        noun: str,
+        criterion: str,
+        base: str | None = None,
+    ) -> dict:
+        """The one entry `search_filter` matches, carrying `attributes`.
+
+        Raises NotFoundError on no match and on more than one, which it names
+        rather than counting: the search stops at the second (§6.3). Shared by
+        every operation that promises exactly one result, so a silent pick
+        among several matches can never reach a caller dressed up as the one
+        it asked for."""
+        entries = self._search(search_filter, attributes, base=base, limit=2)
+        if not entries:
+            raise NotFoundError(f"No {noun} found with {criterion}")
+        if len(entries) > 1:
+            matches = ", ".join(entry["dn"] for entry in entries)
+            raise NotFoundError(f"More than one {noun} with {criterion}: {matches}")
+        return entries[0]
+
+
     def _resolve_dn(
         self,
         search_filter: str,
@@ -331,20 +379,46 @@ class LDAPSearch:
         criterion: str,
         base: str | None = None,
     ) -> str:
-        """DN of the one entry `search_filter` matches.
-
-        Raises NotFoundError on no match and on more than one, which it names
-        rather than counting: the search stops at the second (§6.3)."""
-        entries = self._search(search_filter, [NO_ATTRIBUTES], base=base, limit=2)
-        if not entries:
-            raise NotFoundError(f"No {noun} found with {criterion}")
-        if len(entries) > 1:
-            matches = ", ".join(entry["dn"] for entry in entries)
-            raise NotFoundError(f"More than one {noun} with {criterion}: {matches}")
-        return entries[0]["dn"]
+        """DN of the one entry `search_filter` matches (§6.3)."""
+        return self._find_one(
+            search_filter, [NO_ATTRIBUTES], noun=noun, criterion=criterion, base=base
+        )["dn"]
 
 
-    def resolve_user_dn(self, value: str, *, by: str | None = None) -> str: 
+    def server_info(self) -> str:
+        """Naming contexts and supported controls, read from a throwaway
+        `get_info=ALL` connection rather than `conn` (§9): the first thing to
+        run against a new deployment, since it proves bind and TLS work
+        before any query semantics are in question."""
+        with translated(LDAPConnectionError):
+            conn = self._schema_connect(self._config)
+        try:
+            return str(conn.server.info)
+        finally:
+            _unbind_quietly(conn)
+
+
+    def describe_user(self, value: str, *, by: str = "sAMAccountName") -> dict[str, object]:
+        """Every populated attribute of the one user whose `by` attribute
+        equals `value` (§9) — real data, rather than the schema's list of what
+        AD merely defines.
+
+        `by` defaults to `sAMAccountName`, reliable everywhere, so a site's
+        real attribute names can be discovered before an `AttributeMap` names
+        them. Raises NotFoundError on zero matches and on more than one: `by`
+        pointed at a one-to-many attribute — an employee ID, say — makes a
+        silent pick a live risk, not a theoretical one, and a wrong pick here
+        would show one person's data labelled as another's (§6.3)."""
+        entry = self._find_one(
+            all_of(USER_OBJECT, eq(by, value)),
+            [ALL_ATTRIBUTES, ALL_OPERATIONAL_ATTRIBUTES],
+            noun="user",
+            criterion=f"{by}={value}",
+        )
+        return {"dn": entry["dn"], **entry["attributes"]}
+
+
+    def resolve_user_dn(self, value: str, *, by: str | None = None) -> str:
         """DN of the single user whose `by` attribute equals `value`.
         `by` defaults to the AttributeMap's username attribute (sAMAccountName).
         Raises NotFoundError on no match and on multiple matches."""
@@ -377,6 +451,7 @@ class LDAPSearch:
         *,
         transitive: bool = True,
         include_disabled: bool = False,
+        attributes: Sequence[str] | None = None,
     ) -> list[User]:
         """Every user in `group`, named by DN or by common name, including
         anyone holding it through a nested group unless `transitive=False` (§8.8).
@@ -386,31 +461,38 @@ class LDAPSearch:
             group_dn=self.resolve_group_dn(group),
             transitive=transitive,
             include_disabled=include_disabled,
+            attributes=attributes,
         )
 
 
-    def _reports_of(self, manager_dns: Sequence[str]) -> list[User]:
+    def _reports_of(
+        self, manager_dns: Sequence[str], *, attributes: Sequence[str] | None = None
+    ) -> list[User]:
         """Every user whose manager is one of `manager_dns`, one query per
         `LDAPConfig.batch_size` DNs."""
         found: list[User] = []
         for batch in batched(manager_dns, self._config.batch_size):
             clauses = [eq_dn(self._attrs.manager, dn) for dn in batch]
-            found.extend(self._search_users(all_of(USER_OBJECT, any_of(*clauses))))
+            found.extend(
+                self._search_users(all_of(USER_OBJECT, any_of(*clauses)), attributes=attributes)
+            )
         return found
 
 
-    def direct_reports(self, username: str) -> list[User]:
+    def direct_reports(self, username: str, *, attributes: Sequence[str] | None = None) -> list[User]:
         """The users whose manager is this manager: one hop, one query."""
-        return self._reports_of([self.resolve_user_dn(username)])
+        return self._reports_of([self.resolve_user_dn(username)], attributes=attributes)
 
 
-    def reporting_tree(self, username: str) -> list[User]:
+    def reporting_tree(self, username: str, *, attributes: Sequence[str] | None = None) -> list[User]:
         """Every direct report of this manager, and every direct report of
         those, to any depth."""
-        return self._walk_reports(self.resolve_user_dn(username))
+        return self._walk_reports(self.resolve_user_dn(username), attributes=attributes)
 
 
-    def _walk_reports(self, root_dn: str) -> list[User]:
+    def _walk_reports(
+        self, root_dn: str, *, attributes: Sequence[str] | None = None
+    ) -> list[User]:
         """Breadth-first from `root_dn`, one level at a time, until a level
         yields nobody new."""
         seen = {root_dn.casefold()}
@@ -419,7 +501,7 @@ class LDAPSearch:
 
         while level:
             new: list[User] = []
-            for report in self._reports_of(level):
+            for report in self._reports_of(level, attributes=attributes):
                 if report["dn"].casefold() in seen:
                     continue
                 seen.add(report["dn"].casefold())

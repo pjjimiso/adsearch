@@ -33,7 +33,7 @@ from ldap3.core.exceptions import (
     LDAPUndefinedAttributeTypeResult,
 )
 
-from adsearch import cli, errors
+from adsearch import errors
 from adsearch.errors import (
     LDAPAuthError,
     LDAPConfigError,
@@ -44,7 +44,7 @@ from adsearch.errors import (
 )
 from adsearch.search import LDAPSearch
 
-from tests.conftest import ANN, BO, NullContext, searcher, unbindable
+from tests.conftest import ANN, BO, searcher, unbindable
 from tests.fake_directory import Failure, user
 
 
@@ -228,6 +228,11 @@ OPERATIONS = {
     # querying, so its DN form reaches no directory to fail in.
     "resolve_group_dn": lambda ad: ad.resolve_group_dn("Engineers"),
     "by_group": lambda ad: ad.by_group("Engineers"),
+    "server_info": lambda ad: ad.server_info(),
+    # Zero matches rather than "alee"'s one: `describe_user` caps at `limit=1`,
+    # so a single match stops `islice` without a second pull — the exact pull
+    # that reaches the fake's deferred "iteration" failure (§8.3).
+    "describe_user": lambda ad: ad.describe_user("nobody"),
 }
 
 # Everything that reaches the directory, and so must translate. `close` is
@@ -235,8 +240,12 @@ OPERATIONS = {
 REACHES_THE_DIRECTORY = {
     name: call for name, call in OPERATIONS.items() if name != "close"
 }
+# `server_info` binds but never queries, over its own throwaway connection
+# (§9) — the same reason `conn` is excluded here.
 QUERIES = {
-    name: call for name, call in REACHES_THE_DIRECTORY.items() if name != "conn"
+    name: call
+    for name, call in REACHES_THE_DIRECTORY.items()
+    if name not in ("conn", "server_info")
 }
 
 
@@ -254,9 +263,10 @@ def test_close_is_the_only_public_operation_outside_the_boundary():
     of the `with` block. A translated escaping error is still an escaping error,
     so `close` is excluded on purpose — test_search.py's
     `test_a_teardown_failure_does_not_replace_the_propagating_exception` holds
-    it to that. `conn` binds; everything else queries."""
+    it to that. `conn` and `server_info` bind without querying; everything
+    else queries."""
     assert set(OPERATIONS) - set(REACHES_THE_DIRECTORY) == {"close"}
-    assert set(REACHES_THE_DIRECTORY) - set(QUERIES) == {"conn"}
+    assert set(REACHES_THE_DIRECTORY) - set(QUERIES) == {"conn", "server_info"}
 
 
 @pytest.mark.parametrize("operation", REACHES_THE_DIRECTORY)
@@ -275,39 +285,6 @@ def test_no_ldap3_exception_escapes_when_a_query_fails(operation, during):
     ad = searcher(*DIRECTORY, failure=failure)
     with pytest.raises(LDAPSearchError):
         QUERIES[operation](ad)
-
-
-def test_the_cli_test_subcommand_translates_a_failure_from_who_am_i(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """The third place the library reaches the network. `who_am_i()` is issued
-    straight at the connection, past both handlers, so `test_command` applies
-    `translated()` itself — and `adsearch test` exists to surface a bad bind,
-    which makes it the last command that should report one raw."""
-
-    class Unreachable:
-        """A bind that succeeded and an extended operation that then fails."""
-
-        bound = True
-
-        class extend:
-            class standard:
-                @staticmethod
-                def who_am_i() -> str:
-                    raise LDAPSocketReceiveError("error receiving data")
-
-    class Bound(NullContext):
-        def __init__(self, config, *args, **kwargs) -> None:
-            self.conn = Unreachable()
-
-    monkeypatch.setenv("ADSEARCH_SERVER", "ldaps://dc.test.com")
-    monkeypatch.setenv("ADSEARCH_BASE_DN", "DC=test,DC=com")
-    monkeypatch.delenv("ADSEARCH_BIND_USER", raising=False)
-    monkeypatch.delenv("ADSEARCH_BIND_PASSWORD", raising=False)
-    monkeypatch.setattr(cli, "LDAPSearch", Bound)
-
-    with pytest.raises(LDAPConnectionError):
-        cli.test_command()
 
 
 # --- Exit codes stay out of the library (DESIGN §6.4) ------------------------

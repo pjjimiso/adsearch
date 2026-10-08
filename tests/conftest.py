@@ -64,7 +64,15 @@ def searcher_for(
     The cast is the one lie in this suite: `FakeConnection` implements the
     slice of ldap3's `Connection` that `adsearch` uses, and nothing else."""
     connection = directory.connection()
-    ad = LDAPSearch(config, attrs, connect=lambda _config: cast(Connection, connection))
+    ad = LDAPSearch(
+        config,
+        attrs,
+        connect=lambda _config: cast(Connection, connection),
+        # §9's throwaway connection defaults to the same fake unless a test
+        # overrides it: `server_info` has no reason to fail a sweep that
+        # every other operation passes through this seam.
+        schema_connect=lambda _config: cast(Connection, connection),
+    )
     return ad, connection
 
 
@@ -113,4 +121,4 @@ def unbindable(
     def refuse(_config: LDAPConfig) -> Connection:
         raise error
 
-    return LDAPSearch(config, attrs, connect=refuse)
+    return LDAPSearch(config, attrs, connect=refuse, schema_connect=refuse)
