@@ -400,8 +400,16 @@ that is not the repo root, against the lowest Python version the package declare
 script that must type-check:
 
 ```bash
-scripts/verify_packaging.sh
+scripts/verify_packaging.sh                                  # the release tag
+scripts/verify_packaging.sh --ref my-branch                  # a branch, before the tag exists
+scripts/verify_packaging.sh --remote                         # the published GitHub URL
 ```
+
+Every step installs or checks out one git ref, and that ref has to resolve to `HEAD`. A ref pointing
+anywhere else would install, import and type-check a tree unrelated to your working copy and then
+report success, so it is refused rather than warned about — pass `--ref` with the branch you are on
+while the release tag still points elsewhere. Uncommitted files are named in the closing summary,
+since no step can see them.
 
 The design rationale behind every choice above lives in [docs/DESIGN.md](docs/DESIGN.md), the
 vocabulary in [CONTEXT.md](CONTEXT.md), and the manager-traversal measurements in
