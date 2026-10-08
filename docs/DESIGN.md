@@ -1074,6 +1074,8 @@ offline, without a directory.
 | `src/adsearch/search.py` | Connection lifecycle, the `ldap3` translation boundary (§6.2), paged search core, discovery, resolvers, wrappers |
 | `src/adsearch/cli.py` | argparse, output formatting, exit codes, `getpass`, `basicConfig` |
 | `scripts/benchmark.py` | Benchmark harness: the manager-traversal and group-membership comparisons of ADR-0001, and the filter-complexity probe. Requires a live directory; not packaged in the wheel |
+| `scripts/verify_packaging.sh` | The §11 packaging verification: install from the pinned git URL into a temp directory outside the repo root, type-check the consumer script against that install, and run the suite on the declared Python floor. Refuses a ref that is not `HEAD` |
+| `scripts/consumer_check.py` | The consumer script §11 type-checks: asserts the install came from site-packages with no leaked `src`, and that `py.typed` survived the build. Run and checked only by `verify_packaging.sh`, never by pytest |
 | `tests/conftest.py` | The offline guard — no test opens a socket — the fake-backed `searcher` helpers, and `unbindable` for a rejected bind |
 | `tests/fake_directory.py` | In-memory directory, filter matcher, and the fake connection behind the seam |
 | `tests/test_filters.py` | Filter construction, escaping, and DN validation — the security tests (§7.2, §13) |
@@ -1085,6 +1087,8 @@ offline, without a directory.
 | `tests/test_fake_directory.py` | The fake's own filter matcher |
 | `tests/test_cli.py` | Argument parsing, rendering, the exit-code map and the JSON encoder — the CLI's pure parts — plus whether each subcommand's `with` block releases its connection |
 | `tests/test_benchmark.py` | The benchmark harness's counting, comparison and probe logic, offline against the fake directory |
+| `tests/test_package.py` | The public surface `__all__` promises, and the package-level logging setup (§4.1, §7.4) |
+| `tests/test_readme.py` | README.md's own examples: every Python block executed against the fake directory, every documented command line parsed, and the claims no example can reach — default output format, install tag, exit codes, Python floor, disabled-account handling |
 
 ## Appendix B — References
 

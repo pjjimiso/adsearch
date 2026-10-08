@@ -29,15 +29,13 @@ from adsearch import cli
 from adsearch.cli import build_parser, format_raw, format_users, render_reports, render_users
 from adsearch.errors import (
     LDAPAuthError,
-    LDAPConfigError,
-    LDAPConnectionError,
     LDAPQueryError,
     LDAPSearchError,
     NotFoundError,
 )
 from adsearch.models import DEFAULT_ATTRIBUTES, User
 
-from tests.conftest import NullContext, searcher_with_connection
+from tests.conftest import DOCUMENTED_CODES, NullContext, searcher_with_connection
 from tests.fake_directory import Failure
 
 
@@ -258,14 +256,6 @@ SUBCOMMANDS = [
     ("group", "Engineers"),
     ("describe", "--username", "jdoe"),
     ("resolve-dn", "--username", "jdoe"),
-]
-
-DOCUMENTED_CODES = [
-    (LDAPConfigError, 3),
-    (LDAPAuthError, 4),
-    (LDAPConnectionError, 5),
-    (LDAPQueryError, 6),
-    (NotFoundError, 7),
 ]
 
 
