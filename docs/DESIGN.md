@@ -314,9 +314,15 @@ nothing about worker type.
 
 ### 5.3 `User`
 
-A `TypedDict`, chosen over a dataclass because it *is* a `dict` at runtime: `json.dumps(users)` works
-with no custom encoder, and consumers can treat results as plain data. The cost is subscript access
-(`user["name"]`) and no runtime validation.
+A `TypedDict`, chosen over a dataclass because it *is* a `dict` at runtime: nothing has to be taught
+how to serialize a `User`, and consumers can treat results as plain data. The cost is subscript
+access (`user["name"]`) and no runtime validation.
+
+The five mapped fields are `str` or `str | None` and serialize as they are. `attributes` holds
+whatever `ldap3` returned, which is not all JSON-native — timestamps arrive as `datetime` and
+identifiers such as `objectGUID` as `bytes` — so JSON output goes through the CLI's encoder (§10).
+That is a property of raw directory values, not of the `TypedDict`: a dataclass would need the same
+encoder *and* an `asdict` call first.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -828,8 +834,34 @@ it is the only way to see what the directory is actually returning.
 
 `--attributes` values are validated through `filters.attr()` before reaching a search (§7.2, point 3).
 
-`main()` contains exactly **one** top-level `try`, catching `LDAPSearchError` and mapping exception
-type to the exit code in §6.4. `str(exc)` goes to stderr; the traceback appears only under `--debug`.
+`main()` contains exactly **one** top-level `try`, with a single `except Exception` arm, and
+`exit_code_for` does the classifying: it walks the exception's MRO against the §6.4 map, so a
+consumer that subclasses one of the six inherits its code rather than being filed as a bug in this
+tool. The bare base class has no code of its own and lands on `1`, as does everything unrecognized.
+
+One arm rather than two is deliberate. An `except LDAPSearchError` arm beside it would be dead
+duplication, because `exit_code_for` already returns `1` for anything outside the map — and two arms
+invite two reporting styles. Everything therefore gets the same treatment:
+`f"{type(exc).__name__}: {exc}"` written to stderr and never to stdout, with the traceback only
+under `--debug`, a crash in this tool included. The type name is in the message because a bare
+`str(exc)` from `ldap3` is often a server string with no indication of which of the six it was.
+`KeyboardInterrupt` and `SystemExit` derive from `BaseException`, so they are not caught and a
+Ctrl-C is not reported as a failure of this tool.
+
+`parse_args` sits *outside* the handler. Argparse exits `2` on a usage error itself, which is the one
+failure the CLI does not classify. `main()` returns its code rather than calling `sys.exit`, which is
+what lets a test drive it with an argv list and read the code back.
+
+Naming no subcommand at all is the one usage error the CLI synthesises rather than argparse. It
+returns `2` and prints the help to **stderr**, where argparse sends its own usage errors — on stdout
+it would hand a caller that redirected stdout a page of help where results were expected, and leave
+the caller that saw `2` and read stderr with nothing to read.
+
+`--debug` is declared twice — once on the root parser and once on a parent the subparsers inherit —
+because the operator reaching for a traceback types it wherever it falls. The subparser copy defaults
+to `argparse.SUPPRESS`, without which it would overwrite a `--debug` given *before* the subcommand
+back to `False`. The format flags are inherited by the subparsers only, so they are accepted after
+the subcommand.
 
 Every subcommand opens its `LDAPSearch` with the `with` block from §4.2 and does its work inside it,
 `test` included: bind state and identity are read off the connection before it closes, never after.
@@ -847,6 +879,20 @@ Table, CSV, and JSON are all implemented. What the seam buys is a single *decisi
 single function: `format_users` is the only place the CLI chooses a rendering, though table output
 carries its own row and column-width helpers beside it. One decision point is the concrete, testable
 meaning of "thin CLI".
+
+`render_reports` adds the count and delegates the rendering, so adding a format to the CLI is still
+one edit: the count is not a second place that chooses one.
+
+JSON output passes `cls=DirectoryEncoder`, which handles the raw values in `attributes` that
+`json.dumps` refuses outright (§5.3): `datetime`, `date` and `time` become ISO 8601, `bytes` and the
+other buffer types become base64, and anything else falls back to `str`.
+
+**A permissive `default=str` is rejected.** It never crashes, which is exactly why it is the wrong
+default: `objectGUID` emerges as the text `b'\x8f\x1c…'`, which looks like output, cannot be decoded
+back, and tells the operator doing schema discovery nothing. Base64 round-trips, so the one case
+where an opaque identifier is the answer stays answerable. `str` survives only as the last arm,
+where the alternative is a crash on a type nobody anticipated — and `--raw` is there for the
+operator who needs to see what the directory really sent.
 
 ---
 
@@ -894,6 +940,11 @@ rather than `Any`.
 | Translating in `errors.py` | Translating in `search.py` | `errors.py` imports nothing, which is what keeps exit codes and `ldap3` both out of it (§3.2, §6.4) |
 | Naming socket exceptions one at a time | Catching `LDAPCommunicationError`, the family | Three named members left a failed send and a response timeout arriving as query errors — the exact distinction §6.1 exists to draw (§6.2) |
 | One catch-all type for both handlers | A fallback that follows the site | A bind issues no query; an unnamed bind-time failure called a query error sends the caller to debug a filter that was never sent (§6.2) |
+| `json.dumps(…, default=str)` | A `JSONEncoder` with a typed arm per kind | It never crashes, which is why it is a trap: `objectGUID` emerges as `b'\x8f\x1c…'`, which cannot be decoded back and tells schema discovery nothing (§10) |
+| `exit_code_for` as a `dict[type, int]` lookup | The same map, walked over the MRO | An exact-type lookup files a consumer's subclass of `LDAPQueryError` under the code that means a bug in this tool (§6.4) |
+| An `except LDAPSearchError` arm beside the `except Exception` one | One arm, with `exit_code_for` classifying | The second arm is dead duplication — the map already returns `1` for anything outside it — and two arms invite two reporting styles (§10) |
+| Printing the help to stdout when no subcommand is named | Printing it to stderr, with `2` | It is a usage error, and on stdout it reaches the caller that redirected stdout expecting results (§10) |
+| `main()` calling `sys.exit` | `main()` returning its code | The console script and `__main__` guard both wrap it anyway, and returning is what makes the whole exit-code map reachable from a test (§10) |
 
 ---
 
@@ -950,6 +1001,14 @@ offline, without a directory.
   rather than nominal.
 - The exception hierarchy is exactly the six classes of §6.1, none of which carries an exit code, and
   `errors.py` contains no imports.
+- Every failure class of §6.1 exits with a code distinct from every other and from success, usage,
+  and unexpected failure. A caller distinguishes a rejected bind from no such user by the code alone,
+  never by parsing stderr.
+- No failure reaches a caller as a traceback unless `--debug` was asked for, and nothing a failing
+  run writes about its failure — the message, or the help when no subcommand was named — goes to
+  stdout. A crash in this tool is reported the same way as a rejected bind: one line, on stderr.
+- JSON output of a user succeeds whatever the directory put in `attributes`. Timestamps are ISO 8601
+  and binary values are base64 that decodes back to the original bytes — never a Python `repr`.
 - Against a live directory: a group with more than 1000 members returns more than 1000 entries, and
   transitive and non-transitive group queries return different counts.
 
@@ -992,7 +1051,7 @@ offline, without a directory.
 | `tests/test_search.py` | Search behaviour through the connection seam |
 | `tests/test_errors.py` | The translation boundary and the error hierarchy (§6) |
 | `tests/test_fake_directory.py` | The fake's own filter matcher |
-| `tests/test_cli.py` | Argument parsing and rendering — the CLI's pure parts |
+| `tests/test_cli.py` | Argument parsing, rendering, the exit-code map and the JSON encoder — the CLI's pure parts — plus whether each subcommand's `with` block releases its connection |
 
 ## Appendix B — References
 

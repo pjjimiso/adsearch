@@ -1,16 +1,61 @@
 import argparse
+import base64
+import datetime
 import json
 import csv
 import io
+import sys
+import traceback
+
+from collections.abc import Sequence
 
 from adsearch.config import LDAPConfig
+from adsearch.errors import (
+    LDAPAuthError,
+    LDAPConfigError,
+    LDAPConnectionError,
+    LDAPQueryError,
+    LDAPSearchError,
+    NotFoundError,
+)
 from adsearch.search import LDAPSearch, translated
 from adsearch.models import User
 
 
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+
+# DESIGN §6.4
+_EXIT_CODES: dict[type[LDAPSearchError], int] = {
+    LDAPConfigError: 3,
+    LDAPAuthError: 4,
+    LDAPConnectionError: 5,
+    LDAPQueryError: 6,
+    NotFoundError: 7,
+}
+
+
+def exit_code_for(exc: Exception) -> int:
+    """The documented exit code for a failure, or the unexpected-failure code."""
+    for cls in type(exc).__mro__:
+        code = _EXIT_CODES.get(cls)
+        if code is not None:
+            return code
+    return EXIT_ERROR
+
+
+_DEBUG_HELP = "Print the traceback on failure, not just the message"
+
 
 def build_parser() -> argparse.ArgumentParser:
-    common = argparse.ArgumentParser(add_help=False)
+    # --debug is accepted on either side of the subcommand; SUPPRESS is what
+    # makes that work (DESIGN §10).
+    diagnostics = argparse.ArgumentParser(add_help=False)
+    diagnostics.add_argument("--debug", action="store_true",
+                             default=argparse.SUPPRESS, help=_DEBUG_HELP)
+
+    common = argparse.ArgumentParser(add_help=False, parents=[diagnostics])
     group = common.add_mutually_exclusive_group()
     group.add_argument("--table", dest="fmt", action="store_const", const="table", 
                        help="Output in table format (default)")
@@ -21,9 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
     common.set_defaults(fmt="table")
 
     parser = argparse.ArgumentParser(description="LDAP Search CLI")
+    parser.add_argument("--debug", action="store_true", help=_DEBUG_HELP)
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
-    subparsers.add_parser("test", help="Test the LDAP connection")
+    subparsers.add_parser("test", parents=[diagnostics], help="Test the LDAP connection")
 
     employee_id_parser = subparsers.add_parser("employee", parents=[common], help="Search for a user by employee id")
     employee_id_parser.add_argument("employee_id", type=str, help="employee id")
@@ -46,10 +92,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run one subcommand and return its exit code (DESIGN §6.4)."""
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
+    try:
+        return dispatch(args, parser)
+    except Exception as exc:
+        return report_failure(exc, debug=args.debug)
+
+
+def report_failure(exc: Exception, *, debug: bool) -> int:
+    """Write a failure to stderr and hand back its exit code."""
+    if debug:
+        traceback.print_exc()
+    print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+    return exit_code_for(exc)
+
+
+def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     match args.command:
         case "test": 
             test_command()
@@ -71,7 +133,12 @@ def main() -> None:
             print(format_users(results, args.fmt))
 
         case _:
-            parser.print_help()
+            # A usage error, so it goes where argparse sends its own: stderr,
+            # leaving stdout empty for the caller that redirected it.
+            parser.print_help(sys.stderr)
+            return EXIT_USAGE
+
+    return EXIT_OK
 
 
 def test_command() -> None:
@@ -154,6 +221,17 @@ def build_table(rows: list[list[str]], widths: list[int]) -> str:
     return "\n".join(lines)
 
 
+class DirectoryEncoder(json.JSONEncoder):
+    """JSON for the raw directory values `json.dumps` refuses (DESIGN §10)."""
+
+    def default(self, o: object) -> object:
+        if isinstance(o, (datetime.datetime, datetime.date, datetime.time)):
+            return o.isoformat()
+        if isinstance(o, (bytes, bytearray, memoryview)):
+            return base64.b64encode(bytes(o)).decode("ascii")
+        return str(o)
+
+
 def render_reports(users: list[User], fmt: str) -> str:
     """The manager subcommand's output: the people who report to the manager"""
     return f"{format_users(users, fmt)}\n\n{len(users)} report(s) found"
@@ -169,8 +247,8 @@ def format_users(users: list[User], fmt: str) -> str:
                 writer.writerow([user[col] for col in _COLUMNS])
             return buffer.getvalue()
 
-        case "json": 
-            return json.dumps(users, indent=2)
+        case "json":
+            return json.dumps(users, indent=2, cls=DirectoryEncoder)
 
         case "table": 
             rows = populate_rows(users)
@@ -182,4 +260,4 @@ def format_users(users: list[User], fmt: str) -> str:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
