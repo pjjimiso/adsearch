@@ -1,7 +1,7 @@
 [project]
 name = "adsearch"
 version = "0.1.0"
-description = "A CLI for searching Active Directory"
+description = "A library for querying Active Directory over LDAP, with a thin CLI for schema discovery"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
