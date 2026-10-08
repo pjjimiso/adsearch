@@ -1,8 +1,9 @@
-"""What each subcommand parses, and which library operation it reaches for.
+"""What each subcommand parses, what it renders, and how it fails.
 
-Argument parsing and rendering are pure, so they are tested directly; the
-command functions themselves read the environment and open a connection, and
-are covered by the library tests behind the seam instead.
+Argument parsing, rendering, the exit-code map and the JSON encoder are pure, so
+they are tested directly; the command functions themselves read the environment
+and open a connection, and are covered by the library tests behind the seam
+instead.
 
 Releasing that connection is the exception: `LDAPSearch.close()` is a library
 guarantee already covered in test_search.py, but only the CLI decides whether a
@@ -10,13 +11,30 @@ command's `with` block actually reaches it (issue #15), so that one thing is
 tested here, through the same fake-connection seam.
 """
 
+import ast
+import base64
+import datetime
+import inspect
+import json
+import pathlib
+import textwrap
+
+from collections.abc import Callable
+
 import pytest
 
 from ldap3.core.exceptions import LDAPInvalidFilterError
 
 from adsearch import cli
-from adsearch.cli import build_parser, render_reports
-from adsearch.errors import LDAPQueryError
+from adsearch.cli import build_parser, format_users, render_reports
+from adsearch.errors import (
+    LDAPAuthError,
+    LDAPConfigError,
+    LDAPConnectionError,
+    LDAPQueryError,
+    LDAPSearchError,
+    NotFoundError,
+)
 from adsearch.models import User
 
 from tests.conftest import NullContext, searcher_with_connection
@@ -235,3 +253,327 @@ def test_the_test_subcommand_releases_its_connection_too(monkeypatch: pytest.Mon
     cli.test_command()
 
     assert fake_search.closed is True
+
+
+SUBCOMMANDS = [
+    ("test",),
+    ("employee", "123"),
+    ("manager", "jdoe"),
+    ("cost-center", "1234"),
+    ("group", "Engineers"),
+]
+
+DOCUMENTED_CODES = [
+    (LDAPConfigError, 3),
+    (LDAPAuthError, 4),
+    (LDAPConnectionError, 5),
+    (LDAPQueryError, 6),
+    (NotFoundError, 7),
+]
+
+
+def carrying(attributes: dict[str, object]) -> User:
+    """Bo, plus the raw attributes a real directory hands back."""
+    user = bo()
+    user["attributes"] = attributes
+    return user
+
+
+def failing_command(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """Make `employee` raise where a real one would, opening no connection."""
+
+    def raise_it(_id: str) -> list[User]:
+        raise error
+
+    monkeypatch.setattr(cli, "employee_id_command", raise_it)
+
+
+def rendered_attributes(attributes: dict[str, object]) -> dict[str, object]:
+    """The `attributes` of one user, through the JSON renderer and back."""
+    return json.loads(format_users([carrying(attributes)], "json"))[0]["attributes"]
+
+
+@pytest.mark.parametrize("argv", SUBCOMMANDS, ids=lambda argv: argv[0])
+def test_every_subcommand_accepts_the_debug_flag(argv: tuple[str, ...]):
+    """It selects how a failure is reported, which every subcommand can have."""
+    assert parse(*argv).debug is False
+    assert parse(*argv, "--debug").debug is True
+
+
+@pytest.mark.parametrize("argv", SUBCOMMANDS, ids=lambda argv: argv[0])
+def test_debug_is_accepted_before_the_subcommand_too(argv: tuple[str, ...]):
+    """DESIGN §10 calls it a global flag, and an operator reaching for a
+    traceback types it where it falls. The subparser default must not
+    overwrite one given early back to False."""
+    assert parse("--debug", *argv).debug is True
+
+
+def test_debug_is_answerable_even_with_no_subcommand():
+    """`main` consults it on the path that only prints help, so it is read on
+    a namespace no subparser ever touched."""
+    assert parse().debug is False
+    assert parse("--debug").debug is True
+
+
+@pytest.mark.parametrize(
+    "error, code", DOCUMENTED_CODES, ids=lambda value: getattr(value, "__name__", value)
+)
+def test_each_failure_class_exits_with_its_documented_code(
+    error: type[LDAPSearchError],
+    code: int,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    failing_command(monkeypatch, error("nope"))
+    assert cli.main(["employee", "123"]) == code
+
+
+def test_the_documented_codes_are_distinct():
+    """DESIGN §6.4: callers script against them and need to tell a bad password
+    from no such user without parsing stderr."""
+    codes = [code for _error, code in DOCUMENTED_CODES]
+    assert sorted(set(codes)) == sorted(codes)
+    assert not {cli.EXIT_OK, cli.EXIT_ERROR, cli.EXIT_USAGE} & set(codes)
+
+
+def test_a_failing_command_reports_its_code_and_still_releases_the_connection(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """Where the exit-code map meets the `with` block of issue #15. The two
+    are covered separately above and in test_search.py, but only together do
+    they say that a scripted caller gets its code *and* the domain controller
+    gets its connection back. Asserted through `main`, because the release
+    happens on the way out of the command and the code is decided above it."""
+    ad, connection = searcher_with_connection(
+        failure=Failure(LDAPInvalidFilterError("bad filter"))
+    )
+    configured_env(monkeypatch)
+    monkeypatch.setattr(cli, "LDAPSearch", lambda config: ad)
+
+    assert cli.main(["employee", "123"]) == dict(DOCUMENTED_CODES)[LDAPQueryError]
+    assert connection.bound is False
+    assert "bad filter" in capsys.readouterr().err
+
+
+def test_success_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    monkeypatch.setattr(cli, "employee_id_command", lambda _id: [bo()])
+    assert cli.main(["employee", "123"]) == cli.EXIT_OK
+    assert "bng" in capsys.readouterr().out
+
+
+def test_a_usage_error_exits_two():
+    """argparse owns this one, and the handler must not intercept it."""
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["employee"])
+    assert raised.value.code == cli.EXIT_USAGE
+
+
+def test_naming_no_subcommand_is_a_usage_error(capsys: pytest.CaptureFixture[str]):
+    """Nothing was asked and nothing ran, so the code cannot be success — and
+    the help goes where argparse sends its own usage errors. A caller that saw
+    2 and read stderr to learn why would otherwise get silence."""
+    assert cli.main([]) == cli.EXIT_USAGE
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "usage:" in captured.err
+
+
+def test_an_unexpected_exception_exits_one(monkeypatch: pytest.MonkeyPatch):
+    failing_command(monkeypatch, RuntimeError("nobody planned for this"))
+    assert cli.main(["employee", "123"]) == cli.EXIT_ERROR
+
+
+def test_the_base_error_falls_back_to_the_unexpected_code(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """DESIGN §6.1 gives the base class no code of its own."""
+    failing_command(monkeypatch, LDAPSearchError("bare"))
+    assert cli.main(["employee", "123"]) == cli.EXIT_ERROR
+
+
+def test_a_subclass_keeps_the_code_of_the_class_it_refines(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A consumer that narrows a query error should not have it filed under
+    the code that means a bug in this tool."""
+
+    class SizeLimitExceeded(LDAPQueryError):
+        pass
+
+    failing_command(monkeypatch, SizeLimitExceeded("limit"))
+    assert cli.main(["employee", "123"]) == dict(DOCUMENTED_CODES)[LDAPQueryError]
+
+
+def test_the_cli_has_exactly_one_handler_and_it_is_in_the_entry_point():
+    """DESIGN §10. A second `try` anywhere in the module is the exit-code
+    decision starting to spread, and the first step towards two commands
+    failing in two different ways — so the whole file is checked, not just
+    `main`, which would let one appear in `dispatch` unnoticed."""
+    module = ast.parse(pathlib.Path(cli.__file__).read_text())
+    assert [
+        node.name
+        for node in ast.walk(module)
+        if isinstance(node, ast.FunctionDef)
+        if any(isinstance(child, ast.Try) for child in ast.walk(node))
+    ] == ["main"]
+    entry = ast.parse(textwrap.dedent(inspect.getsource(cli.main)))
+    assert len([n for n in ast.walk(entry) if isinstance(n, ast.Try)]) == 1
+
+
+def test_the_message_goes_to_stderr_and_leaves_stdout_clean(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """A caller redirecting stdout into a parser gets results or nothing."""
+    failing_command(monkeypatch, LDAPAuthError("bind rejected"))
+    cli.main(["employee", "123"])
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "bind rejected" in captured.err
+
+
+def test_the_traceback_is_withheld_until_it_is_asked_for(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    failing_command(monkeypatch, LDAPAuthError("bind rejected"))
+    cli.main(["employee", "123"])
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_the_debug_flag_adds_the_traceback_without_losing_the_message(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    failing_command(monkeypatch, LDAPAuthError("bind rejected"))
+    cli.main(["employee", "123", "--debug"])
+    captured = capsys.readouterr()
+    assert "Traceback" in captured.err
+    assert "bind rejected" in captured.err
+
+
+def test_an_unexpected_failure_withholds_its_traceback_too(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """One rule for both arms: nothing reaches a caller as a traceback unless
+    asked for, which is the whole of what made the CLI unscriptable."""
+    failing_command(monkeypatch, RuntimeError("nobody planned for this"))
+    cli.main(["employee", "123"])
+    quiet = capsys.readouterr().err
+    cli.main(["employee", "123", "--debug"])
+    loud = capsys.readouterr().err
+    assert "Traceback" not in quiet
+    assert "nobody planned for this" in quiet
+    assert "Traceback" in loud
+
+
+def test_the_plain_encoder_refuses_real_directory_data():
+    """The premise of the custom encoder, pinned rather than taken on faith:
+    `json.dumps` raises on exactly the values a directory returns."""
+    with pytest.raises(TypeError):
+        json.dumps({"objectGUID": b"\x8f\x1c"})
+    with pytest.raises(TypeError):
+        json.dumps({"whenCreated": datetime.datetime(2026, 3, 1)})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        datetime.datetime(2026, 3, 1, 12, 30, 45, tzinfo=datetime.timezone.utc),
+        datetime.date(2026, 3, 1),
+        datetime.time(12, 30, 45),
+    ],
+    ids=["datetime", "date", "time"],
+)
+def test_json_renders_a_timestamp_in_iso_8601(
+    value: datetime.datetime | datetime.date | datetime.time,
+):
+    assert rendered_attributes({"whenCreated": value}) == {
+        "whenCreated": value.isoformat()
+    }
+
+
+GUID = b"\x8f\x1c\x00\xd4\x9a\x7b\x4e\x11\xa2\x55\x00\x0c\x29\x3f\x5e\x01"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [GUID, bytearray(GUID), memoryview(GUID)],
+    ids=["bytes", "bytearray", "memoryview"],
+)
+def test_json_renders_binary_as_base64(value: object):
+    """Every buffer type goes through the same arm. A `bytearray` falling to
+    the `str` fallback would render `bytearray(b'...')` — the exact unusable
+    output the base64 arm exists to prevent."""
+    encoded = rendered_attributes({"objectGUID": value})["objectGUID"]
+    assert isinstance(encoded, str)
+    assert base64.b64decode(encoded) == GUID
+
+
+def test_binary_is_not_stringified_into_something_unusable():
+    """The rejected alternative. A permissive stringify default never crashes,
+    which is why it is a trap: an object GUID emerges as a Python bytes repr,
+    which looks like output and leaves schema discovery nothing to use."""
+    guid = b"\x8f\x1c\x00\xd4"
+    encoded = rendered_attributes({"objectGUID": guid})["objectGUID"]
+    assert isinstance(encoded, str)
+    assert encoded == base64.b64encode(guid).decode("ascii")
+    assert "\\x" not in encoded
+    assert not encoded.startswith("b'")
+
+
+def test_json_falls_back_to_a_string_for_anything_else():
+    class Unforeseen:
+        def __str__(self) -> str:
+            return "whatever the directory sent"
+
+    assert rendered_attributes({"odd": Unforeseen()}) == {
+        "odd": "whatever the directory sent"
+    }
+
+
+def test_json_output_of_a_user_carrying_timestamps_and_binary_succeeds():
+    """The acceptance criterion: the format meets an actual directory."""
+    user = carrying(
+        {
+            "whenCreated": datetime.datetime(
+                2026, 3, 1, 12, 30, 45, tzinfo=datetime.timezone.utc
+            ),
+            "objectGUID": b"\x8f\x1c\x00\xd4\x9a\x7b\x4e\x11",
+            "objectSid": b"\x01\x05\x00\x00\x00\x00\x00\x05",
+            "memberOf": ["CN=Engineers,OU=Groups,DC=test,DC=com"],
+            "userAccountControl": 512,
+        }
+    )
+    rendered = json.loads(format_users([user], "json"))
+    assert rendered[0]["username"] == "bng"
+    assert rendered[0]["attributes"]["userAccountControl"] == 512
+    assert rendered[0]["attributes"]["memberOf"] == [
+        "CN=Engineers,OU=Groups,DC=test,DC=com"
+    ]
+
+
+@pytest.mark.parametrize(
+    "render", [format_users, render_reports], ids=["users", "reports"]
+)
+def test_an_unknown_format_is_rejected_in_one_place(
+    render: Callable[[list[User], str], str],
+):
+    """DESIGN §10: `format_users` is the only place the CLI chooses a
+    rendering, so every entry point fails there and not on its own terms."""
+    with pytest.raises(ValueError, match="Unknown format"):
+        render([bo()], "yaml")
+
+
+def test_the_report_renderer_delegates_the_format_decision(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """It adds the count and nothing else, so it never learns what a format
+    is — the count is not a second place to choose a rendering."""
+    seen: list[str] = []
+
+    def recorder(users: list[User], fmt: str) -> str:
+        seen.append(fmt)
+        return ""
+
+    monkeypatch.setattr(cli, "format_users", recorder)
+    render_reports([bo()], "csv")
+    assert seen == ["csv"]
