@@ -28,5 +28,30 @@ level returns nothing new.
   criteria in a single query. Traversal therefore accepts no criteria; callers filter the result.
 - Cycle detection is now this library's responsibility rather than the directory's.
 - **This finding is specific to `manager`.** Group membership continues to use `IN_CHAIN` on
-  `memberOf`, where nesting is shallow and the cost is expected to be acceptable. That expectation is
-  not yet measured.
+  `memberOf`, where nesting is shallow and the cost is expected to be acceptable. That expectation
+  rests on a benchmark, not a measurement (see below).
+
+## Benchmark harness
+
+The harness that produced the 600x figure above was deleted, leaving the most consequential decision
+in this codebase without reproducible evidence. `scripts/benchmark.py` replaces it and extends it to
+the open question this ADR's last bullet leaves hanging:
+
+- `manager <username>` reproduces this ADR's comparison: the level-by-level walk (`reporting_tree`)
+  against the single `IN_CHAIN` query it replaced, timed against the same reporting tree, alongside
+  that tree's size and depth.
+- `group <name>` times `by_group` transitive against direct-only on a real group, which is the
+  group-membership half of the expectation above — unmeasured until this is run against one large
+  enough to be informative.
+- `filter-complexity` probes whether a `batch_size`-wide disjunction of `eq_dn(manager, ...)` clauses —
+  the exact shape a wide level batches into — is itself rejected by the directory, since that failure
+  would hit precisely the large trees the walk exists to serve.
+
+It requires a live directory and is not run by the test suite; `tests/test_benchmark.py` covers its
+logic offline, against the same fake directory the rest of the library is tested with.
+
+**Figures are not yet recorded.** Running the harness against a real directory, recording the result
+here (tree size and depth, and the group benchmark's counts and timings), and — if transitive group
+matching proves unacceptable — raising a follow-up issue to change the *mechanism* rather than the
+default (§ Consequences; the default rests on correctness, not speed) is the work this ADR is still
+waiting on.
