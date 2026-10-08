@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from ldap3 import NO_ATTRIBUTES, SUBTREE
+from ldap3.utils.dn import parse_dn
 
 from adsearch.filters import ACCOUNTDISABLE, BIT_AND, IN_CHAIN
 
@@ -313,15 +314,31 @@ def user(
     return Entry(dn=dn, attributes=values)
 
 
-def group(dn: str, *, member_of: Sequence[str] = ()) -> Entry:
+def _rdn_value(dn: str) -> str:
+    """The value of a DN's first component: `CN=Engineers,OU=Groups,…` -> `Engineers`."""
+    return parse_dn(dn)[0][1]
+
+
+def group(
+    dn: str,
+    *,
+    member_of: Sequence[str] = (),
+    **attributes: str | Sequence[str],
+) -> Entry:
     """A group entry. `member_of` nests it inside another group, which is what
-    the transitive matching rule walks."""
+    the transitive matching rule walks.
+
+    `cn` defaults to the DN's own first RDN value, as a real group's does, and
+    is overridable."""
     values: dict[str, list[str]] = {
         "objectClass": ["top", "group"],
         "objectCategory": ["group"],
+        "cn": [_rdn_value(dn)],
     }
     if member_of:
         values["memberOf"] = list(member_of)
+    for name, value in attributes.items():
+        values[name] = [value] if isinstance(value, str) else list(value)
     return Entry(dn=dn, attributes=values)
 
 
@@ -364,8 +381,10 @@ class _Standard:
     ):
         """The exact keyword surface `LDAPSearch._search` calls, spelled out
         rather than taken as `**kwargs`, so a renamed keyword fails loudly here
-        instead of being silently swallowed. `paged_size` is accepted and
-        ignored: chunking changes nothing `_search` can observe."""
+        instead of being silently swallowed. `paged_size` is recorded and then
+        ignored: chunking changes nothing `_search` can observe, but the size
+        asked for is what a caller would truncate a large group with."""
+        self._directory.page_sizes.append(paged_size)
         self._directory.fail_now("call")
         stream = self._stream(search_base, search_filter, attributes)
         return stream if generator else list(stream)
@@ -418,6 +437,7 @@ class FakeDirectory:
         self.referrals = list(referrals)
         self.failure = failure
         self.consumed = 0
+        self.page_sizes: list[int] = []
 
     def pulled(self) -> None:
         """One entry handed over. Called before the yield, so the tally is what

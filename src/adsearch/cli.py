@@ -33,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
     manager_parser.add_argument("--all-reports", action="store_true",
                                 help="Walk the manager's entire reporting tree instead of one hop. Many queries; see ADR-0001")
 
+    group_parser = subparsers.add_parser("group", parents=[common], help="Search for a group's members by common name or DN")
+    group_parser.add_argument("group", type=str, help="group common name or DN")
+    group_parser.add_argument("--no-transitive", dest="transitive", action="store_false",
+                              help="Direct members only, excluding anyone who holds the group through a nested group")
+
     return parser
 
 
@@ -51,6 +56,10 @@ def main() -> None:
         case "manager":
             results = manager_command(args.username, all_reports=args.all_reports)
             print(render_reports(results, args.fmt))
+
+        case "group":
+            results = group_command(args.group, transitive=args.transitive)
+            print(format_users(results, args.fmt))
 
         case _:
             parser.print_help()
@@ -78,6 +87,12 @@ def manager_command(username: str, *, all_reports: bool = False) -> list[User]:
     if all_reports:
         return search.reporting_tree(username)
     return search.direct_reports(username)
+
+
+def group_command(group: str, *, transitive: bool = True) -> list[User]:
+    config = LDAPConfig.from_env()
+    search = LDAPSearch(config)
+    return search.by_group(group, transitive=transitive)
 
 
 _COLUMNS = ("username", "dn", "name", "employee_id", "email")

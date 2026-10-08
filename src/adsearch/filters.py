@@ -8,6 +8,7 @@ from adsearch.errors import LDAPQueryError
 
 
 USER_OBJECT = "(&(objectCategory=person)(objectClass=user))"
+GROUP_OBJECT = "(objectCategory=group)"
 IN_CHAIN = "1.2.840.113556.1.4.1941"   # LDAP_MATCHING_RULE_IN_CHAIN OID
 BIT_AND = "1.2.840.113556.1.4.803"     # LDAP_MATCHING_RULE_BIT_AND OID
 ACCOUNTDISABLE = 2                     # the userAccountControl bit for a disabled account
@@ -84,6 +85,15 @@ def valid_dn(dn: str) -> str:
     except LDAPInvalidDnError as e:
         raise LDAPQueryError(f"Invalid DN: {dn}") from e
     return dn
+
+
+def is_dn(value: str) -> bool:
+    """Whether a value parses as a DN, asked rather than asserted (§8.6)."""
+    try:
+        parse_dn(value)
+    except LDAPInvalidDnError:
+        return False
+    return True
 
 
 def eq_dn(attribute: str, dn: str) -> str:

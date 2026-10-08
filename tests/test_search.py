@@ -505,3 +505,179 @@ def test_the_disabled_exclusion_stops_at_the_criterion():
     )
     assert searcher(*entries).find_users(manager_dn=ANN) == []
     assert usernames(searcher(*entries).direct_reports("alee")) == ["bng"]
+
+
+# --- Group membership (DESIGN §8.8) ------------------------------------------
+
+
+GROUP_BASE = f"OU=Groups,{BASE_DN}"
+SERVICE_ENGINEERS = f"CN=Engineers,OU=Service Accounts,{BASE_DN}"
+
+
+def group_inside_a_group() -> tuple[Entry, ...]:
+    """One group inside another, carrying a member at each level."""
+    return (
+        group(PARENT_GROUP),
+        group(GROUP, member_of=[PARENT_GROUP]),
+        user(ANN, sAMAccountName="alee", member_of=[GROUP]),
+        user(BO, sAMAccountName="bng", member_of=[PARENT_GROUP]),
+    )
+
+
+def test_a_group_is_enumerated_by_common_name():
+    """A group can be named the way a human would name it, which is the whole
+    of what the resolve step buys."""
+    ad = searcher(
+        group(GROUP),
+        user(ANN, sAMAccountName="alee", member_of=[GROUP]),
+        user(BO, sAMAccountName="bng"),
+    )
+    assert usernames(ad.by_group("Engineers")) == ["alee"]
+
+
+def test_a_group_dn_is_taken_at_face_value_rather_than_resolved():
+    """A DN is already the answer a resolve would return, so asking the
+    directory for it again is a round trip spent to learn nothing."""
+    directory = RecordingDirectory(
+        group(GROUP),
+        user(ANN, sAMAccountName="alee", member_of=[GROUP]),
+    )
+    ad, _connection = searcher_for(directory)
+
+    assert usernames(ad.by_group(GROUP)) == ["alee"]
+    assert len(directory.filters) == 1, "a DN needs no resolve query"
+
+
+def test_group_membership_is_transitive_by_default():
+    """DESIGN §8.8: deliberately the inverse of the reporting tree's default.
+    A nested group silently hiding a member is the wrong answer that matters in
+    an audit, so full depth is what you get without asking."""
+    ad = searcher(*group_inside_a_group())
+    assert usernames(ad.by_group("All Staff")) == ["alee", "bng"]
+
+
+def test_group_membership_can_be_restricted_to_direct_members():
+    ad = searcher(*group_inside_a_group())
+    assert usernames(ad.by_group("All Staff", transitive=False)) == ["bng"]
+
+
+def test_a_member_two_groups_deep_is_still_a_member():
+    """The nested *group* objects match the transitive filter too, so the
+    user-object clause of DESIGN §8.5 is what keeps a group out of a member
+    list."""
+    backend = f"CN=Backend,OU=Groups,{BASE_DN}"
+    ad = searcher(
+        group(PARENT_GROUP),
+        group(GROUP, member_of=[PARENT_GROUP]),
+        group(backend, member_of=[GROUP]),
+        user(ANN, sAMAccountName="alee", member_of=[backend]),
+    )
+    assert [found["dn"] for found in ad.by_group("All Staff")] == [ANN]
+
+
+def test_a_disabled_member_is_excluded_from_a_group_unless_requested():
+    """DESIGN §8.5: "a disabled account still in a privileged group" is itself
+    an audit finding, so enumeration can ask for one."""
+    entries = (
+        group(GROUP),
+        user(ANN, sAMAccountName="alee", member_of=[GROUP]),
+        user(BO, sAMAccountName="bng", member_of=[GROUP], disabled=True),
+    )
+    assert usernames(searcher(*entries).by_group("Engineers")) == ["alee"]
+    assert usernames(
+        searcher(*entries).by_group("Engineers", include_disabled=True)
+    ) == ["alee", "bng"]
+
+
+def test_a_group_larger_than_one_page_returns_every_member():
+    """DESIGN §8.3: the search is paged at the configured size and applies no
+    result cap, so a group wider than a page is not truncated to one. The
+    chunking itself is ldap3's, and is the live-directory invariant of DESIGN
+    §13; what is observable offline is the size asked for and the fact that
+    nothing stops the result generator early."""
+    members = [
+        user(f"CN=User {i},OU=Users,{BASE_DN}", sAMAccountName=f"u{i}", member_of=[GROUP])
+        for i in range(5)
+    ]
+    directory = FakeDirectory(group(GROUP), *members)
+    ad, _connection = searcher_for(directory, config=replace(CONFIG, page_size=2))
+
+    assert len(ad.by_group(GROUP)) == 5
+    assert directory.page_sizes == [2], "the paged core was asked for the configured size"
+    assert directory.consumed == 5, "and every entry behind the first page was consumed"
+
+
+def test_resolving_a_group_to_a_dn_is_available_on_its_own():
+    """Public because it is independently useful and because `resolve-dn` is a
+    debugging subcommand (DESIGN §8.6)."""
+    ad = searcher(group(GROUP))
+    assert ad.resolve_group_dn("Engineers") == GROUP
+
+
+def test_a_person_sharing_the_group_name_is_not_mistaken_for_the_group():
+    """DESIGN §8.6 filters the resolve on the object category as well as the
+    name. `cn` is populated on every entry in a directory, so without that
+    clause a person who happens to share the group's name makes the name
+    ambiguous — or resolves as the group outright."""
+    ad = searcher(
+        group(GROUP),
+        user(f"CN=Engineers,OU=Users,{BASE_DN}", sAMAccountName="eng", cn="Engineers"),
+    )
+    assert ad.resolve_group_dn("Engineers") == GROUP
+
+
+def test_a_group_name_is_matched_whole_rather_than_as_a_fragment():
+    """A resolve key is exact (CONTEXT.md). A fragment that happened to narrow
+    to one group would enumerate a group the caller never named."""
+    ad = searcher(group(GROUP))
+    with pytest.raises(NotFoundError, match="No group"):
+        ad.resolve_group_dn("Engineer")
+
+
+def test_resolving_a_group_name_that_matches_nothing_raises():
+    """DESIGN §6.3: the empty list a caller would otherwise get back is
+    indistinguishable from a group that really has no members."""
+    ad = searcher(group(GROUP))
+    with pytest.raises(NotFoundError, match="No group"):
+        ad.resolve_group_dn("Marketing")
+
+
+def test_resolving_an_ambiguous_group_name_raises_rather_than_picking_one():
+    ad = searcher(group(GROUP, cn="All Staff"), group(PARENT_GROUP))
+    with pytest.raises(NotFoundError, match="More than one group"):
+        ad.resolve_group_dn("All Staff")
+
+
+def test_a_group_name_is_searched_for_under_the_group_search_base():
+    entries = (group(GROUP), group(SERVICE_ENGINEERS))
+    scoped = replace(CONFIG, group_base_dn=GROUP_BASE)
+    assert searcher(*entries, config=scoped).resolve_group_dn("Engineers") == GROUP
+
+
+def test_without_a_group_base_the_whole_directory_is_in_scope():
+    """The fallback of DESIGN §5.1 is not cosmetic: the same two groups become
+    ambiguous once the search base widens to the base DN."""
+    entries = (group(GROUP), group(SERVICE_ENGINEERS))
+    with pytest.raises(NotFoundError, match="More than one group"):
+        searcher(*entries).resolve_group_dn("Engineers")
+
+
+def test_a_caller_supplied_wildcard_does_not_widen_a_group_name():
+    """DESIGN §7.2: the escape makes a literal of it, so a group named `*` is
+    looked for and not found rather than every group matching."""
+    ad = searcher(group(GROUP), group(PARENT_GROUP))
+    with pytest.raises(NotFoundError, match="No group"):
+        ad.by_group("*")
+
+
+def test_an_enumeration_does_not_pick_up_a_same_named_group_elsewhere():
+    """The scoping above, asserted on members rather than on the resolve: the
+    service account is in a group with the same name and must not appear."""
+    entries = (
+        group(GROUP),
+        group(SERVICE_ENGINEERS),
+        user(ANN, sAMAccountName="alee", member_of=[GROUP]),
+        user(BO, sAMAccountName="svc-bng", member_of=[SERVICE_ENGINEERS]),
+    )
+    scoped = replace(CONFIG, group_base_dn=GROUP_BASE)
+    assert usernames(searcher(*entries, config=scoped).by_group("Engineers")) == ["alee"]

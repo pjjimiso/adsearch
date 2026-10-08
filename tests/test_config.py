@@ -29,3 +29,26 @@ def test_password_not_in_repr():
 def test_empty_env():
     with pytest.raises(LDAPConfigError):
         LDAPConfig.from_env({})
+
+
+def test_the_group_search_base_falls_back_to_the_base_dn():
+    """DESIGN §5.1: a site that keeps its groups in the same tree as its users
+    configures nothing, rather than repeating the base DN."""
+    config = LDAPConfig(server="ldaps://x", base_dn="DC=x,DC=com")
+    assert config.group_search_base == "DC=x,DC=com"
+
+
+def test_a_configured_group_base_dn_is_the_group_search_base():
+    config = LDAPConfig(
+        server="ldaps://x", base_dn="DC=x,DC=com", group_base_dn="OU=Groups,DC=x,DC=com"
+    )
+    assert config.group_search_base == "OU=Groups,DC=x,DC=com"
+
+
+def test_the_group_base_dn_comes_from_the_environment():
+    config = LDAPConfig.from_env({
+        "ADSEARCH_SERVER": "ldaps://x",
+        "ADSEARCH_BASE_DN": "DC=x,DC=com",
+        "ADSEARCH_GROUP_BASE_DN": "OU=Groups,DC=x,DC=com",
+    })
+    assert config.group_search_base == "OU=Groups,DC=x,DC=com"

@@ -233,3 +233,17 @@ def test_an_unsupported_matching_rule_is_an_error_not_a_silent_match():
     directory = FakeDirectory(user(ANN))
     with pytest.raises(FilterSyntaxError):
         directory.search(BASE_DN, "(memberOf:1.2.3.4:=CN=x,DC=y)")
+
+
+def test_a_fake_group_carries_the_common_name_from_its_own_dn():
+    """A real group's `cn` is its RDN, which is what makes resolving one by
+    name against this directory a test of the library and not of the fixture."""
+    entry = group(f"CN=All Staff,OU=Groups,{BASE_DN}")
+    assert entry.values("cn") == ["All Staff"]
+
+
+def test_a_fake_group_can_be_given_a_common_name_of_its_own():
+    """A group whose `cn` disagrees with its RDN is a directory this library
+    will meet, and the only way to put two same-named groups in one scope."""
+    entry = group(f"CN=Engineers,OU=Groups,{BASE_DN}", cn="All Staff")
+    assert entry.values("cn") == ["All Staff"]

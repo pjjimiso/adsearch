@@ -43,6 +43,7 @@ from adsearch.errors import (
     NotFoundError,
 )
 from adsearch.filters import (
+    GROUP_OBJECT,
     NOT_DISABLED,
     USER_OBJECT,
     all_of,
@@ -52,6 +53,7 @@ from adsearch.filters import (
     attr,
     eq_dn,
     in_chain,
+    is_dn,
     valid_dn,
     valid_fragment,
 )
@@ -321,20 +323,70 @@ class LDAPSearch:
         )
 
 
+    def _resolve_dn(
+        self,
+        search_filter: str,
+        *,
+        noun: str,
+        criterion: str,
+        base: str | None = None,
+    ) -> str:
+        """DN of the one entry `search_filter` matches.
+
+        Raises NotFoundError on no match and on more than one, which it names
+        rather than counting: the search stops at the second (§6.3)."""
+        entries = self._search(search_filter, [NO_ATTRIBUTES], base=base, limit=2)
+        if not entries:
+            raise NotFoundError(f"No {noun} found with {criterion}")
+        if len(entries) > 1:
+            matches = ", ".join(entry["dn"] for entry in entries)
+            raise NotFoundError(f"More than one {noun} with {criterion}: {matches}")
+        return entries[0]["dn"]
+
+
     def resolve_user_dn(self, value: str, *, by: str | None = None) -> str: 
         """DN of the single user whose `by` attribute equals `value`.
         `by` defaults to the AttributeMap's username attribute (sAMAccountName).
-        Raises NotFoundError on no match and on multiple matches, which it
-        names rather than counting: the search stops at the second."""
+        Raises NotFoundError on no match and on multiple matches."""
         attribute = self._attrs.username if by is None else by
-        search_filter = all_of(USER_OBJECT, eq(attribute, value))
-        entries = self._search(search_filter, [NO_ATTRIBUTES], limit=2)
-        if not entries:
-            raise NotFoundError(f"No user found with {attribute}={value}")
-        if len(entries) > 1:
-            matches = ", ".join(entry["dn"] for entry in entries)
-            raise NotFoundError(f"More than one user with {attribute}={value}: {matches}")
-        return entries[0]["dn"]
+        return self._resolve_dn(
+            all_of(USER_OBJECT, eq(attribute, value)),
+            noun="user",
+            criterion=f"{attribute}={value}",
+        )
+
+
+    def resolve_group_dn(self, group: str) -> str:
+        """DN of one group, named either by DN or by common name.
+
+        A name is searched for under `LDAPConfig.group_search_base`; raises
+        NotFoundError on no match and on an ambiguous one (§8.6)."""
+        if is_dn(group):
+            return group
+        return self._resolve_dn(
+            all_of(GROUP_OBJECT, eq(self._attrs.cn, group)),
+            noun="group",
+            criterion=f"{self._attrs.cn}={group}",
+            base=self._config.group_search_base,
+        )
+
+
+    def by_group(
+        self,
+        group: str,
+        *,
+        transitive: bool = True,
+        include_disabled: bool = False,
+    ) -> list[User]:
+        """Every user in `group`, named by DN or by common name, including
+        anyone holding it through a nested group unless `transitive=False` (§8.8).
+
+        Membership implied by `primaryGroupID` is not reflected (§14)."""
+        return self.find_users(
+            group_dn=self.resolve_group_dn(group),
+            transitive=transitive,
+            include_disabled=include_disabled,
+        )
 
 
     def _reports_of(self, manager_dns: Sequence[str]) -> list[User]:

@@ -35,6 +35,11 @@ class LDAPConfig:
         if not self.validate_cert:
             warnings.warn("Disabling certificate validation is not recommended for production use", UserWarning)
 
+    @property
+    def group_search_base(self) -> str:
+        """The base for group searches, falling back to `base_dn` when unset."""
+        return self.base_dn if self.group_base_dn is None else self.group_base_dn
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> LDAPConfig:
         env = os.environ if env is None else env

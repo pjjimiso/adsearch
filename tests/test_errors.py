@@ -224,6 +224,10 @@ OPERATIONS = {
     "resolve_user_dn": lambda ad: ad.resolve_user_dn("alee"),
     "direct_reports": lambda ad: ad.direct_reports("alee"),
     "reporting_tree": lambda ad: ad.reporting_tree("alee"),
+    # Named, never passed a DN: `resolve_group_dn` returns a DN without
+    # querying, so its DN form reaches no directory to fail in.
+    "resolve_group_dn": lambda ad: ad.resolve_group_dn("Engineers"),
+    "by_group": lambda ad: ad.by_group("Engineers"),
 }
 
 # Everything that reaches the directory, and so must translate. `close` is
