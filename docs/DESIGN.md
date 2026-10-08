@@ -17,10 +17,10 @@ A generic Python library for querying Active Directory over LDAP.
 
 | Question | Entry point |
 |---|---|
-| Who is this employee ID? | `by_employee_id` |
+| Who is this employee ID? | `find_users(employee_id=...)` |
 | Who are this manager's direct reports (by username)? | `direct_reports` |
 | Who is in this manager's reporting tree (by username)? | `reporting_tree` |
-| Who is in this cost center? | `by_cost_center` |
+| Who is in this cost center? | `find_users(cost_center=...)` |
 | Who is in this group? | `by_group` |
 | Who has this attribute value? | `by_attribute` |
 | Arbitrary AND-composition of the above | `find_users` |
@@ -298,6 +298,13 @@ is the one place a site corrects reality without editing code.
 `extra` is a tuple rather than a list because a frozen dataclass with a mutable default is a defect.
 
 `fetch_attributes()` returns every attribute name to request on a user search, including `extra`.
+
+`cost_center` is the weakest default here and the first one to verify against the real directory
+(§9). `departmentNumber` is a standard attribute, so a site that records its accounting unit
+elsewhere answers a cost-center search with no error and no users, which reads exactly like an empty
+accounting unit. An attribute the schema does not define at all fails loudly instead
+(`undefinedAttributeType`, translated per §6.2); the quiet failure is the defined-but-unpopulated
+one, which is the case this default lands in. It is a starting guess, not a fact.
 
 **No `is_bluebadge`, `bluebadge_values`, or `contractor_upn_suffixes`.** That classification is the
 consumer's (§1.4). Recorded so it is not rediscovered: the plausible candidates at a given site are
@@ -680,12 +687,14 @@ it with `limit` is the cheap exploratory form.
 
 ### 8.6 Named wrappers
 
-Three of the four primary criteria are **not single-filter operations** — manager and group both
+Two of the four primary criteria are **not single-filter operations** — manager and group both
 require resolving a DN first. That logic must live somewhere, and a named wrapper is the honest place
-for it. Manager is the one criterion with two wrappers rather than one, for the reason in §8.7, and
-both take a username so that no caller resolves a manager DN itself. `by_attribute` covers the
-residual case without inventing a query DSL: any site-specific attribute a consumer cares about is
-reachable without a library change.
+for it. The other two, employee ID and cost center, are one `eq()` clause each with nothing to
+resolve, and are reached as `find_users` criteria rather than through a wrapper that would only
+forward its argument. Manager is the one criterion with two wrappers rather than one, for the reason
+in §8.7, and both take a username so that no caller resolves a manager DN itself. `by_attribute`
+covers the residual case without inventing a query DSL: any site-specific attribute a consumer cares
+about is reachable without a library change.
 
 `resolve_user_dn` and `resolve_group_dn` are public because they are independently useful and because
 `resolve-dn` is a valuable debugging subcommand. `resolve_group_dn` accepts either a DN or a CN: if
@@ -809,6 +818,10 @@ Two flags are **subcommand-scoped**, because each selects between two library op
 modifying one: `manager --all-reports` calls `reporting_tree` instead of `direct_reports` (§8.7), and
 `group --no-transitive` asks for direct membership only (§8.8). `manager` prints how many reports were
 found beneath the rendered result, which is what tells an operator a short answer from an empty one.
+
+`cost-center` takes an accounting unit and nothing else: which attribute holds one is the attribute
+map's answer, not a CLI flag (§5.2). Its own help text says the default is low confidence, because
+the operator reading it is the person who can check.
 
 `--raw` emits the unmapped `ldap3` dict as JSON, bypassing the `User` mapper. During schema discovery
 it is the only way to see what the directory is actually returning.

@@ -33,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
     manager_parser.add_argument("--all-reports", action="store_true",
                                 help="Walk the manager's entire reporting tree instead of one hop. Many queries; see ADR-0001")
 
+    cost_center_parser = subparsers.add_parser("cost-center", parents=[common], help="Search for a cost center's users")
+    cost_center_parser.add_argument("cost_center", type=str,
+                                    help="cost center, keyed on the attribute map's cost_center attribute "
+                                         "(default departmentNumber: low confidence, verify it per site)")
+
     group_parser = subparsers.add_parser("group", parents=[common], help="Search for a group's members by common name or DN")
     group_parser.add_argument("group", type=str, help="group common name or DN")
     group_parser.add_argument("--no-transitive", dest="transitive", action="store_false",
@@ -56,6 +61,10 @@ def main() -> None:
         case "manager":
             results = manager_command(args.username, all_reports=args.all_reports)
             print(render_reports(results, args.fmt))
+
+        case "cost-center":
+            results = cost_center_command(args.cost_center)
+            print(format_users(results, args.fmt))
 
         case "group":
             results = group_command(args.group, transitive=args.transitive)
@@ -87,6 +96,12 @@ def manager_command(username: str, *, all_reports: bool = False) -> list[User]:
     if all_reports:
         return search.reporting_tree(username)
     return search.direct_reports(username)
+
+
+def cost_center_command(cost_center: str) -> list[User]:
+    config = LDAPConfig.from_env()
+    search = LDAPSearch(config)
+    return search.find_users(cost_center=cost_center)
 
 
 def group_command(group: str, *, transitive: bool = True) -> list[User]:

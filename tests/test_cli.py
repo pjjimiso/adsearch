@@ -1,4 +1,4 @@
-"""The manager subcommand's two operations, and the count it reports.
+"""What each subcommand parses, and which library operation it reaches for.
 
 Argument parsing and rendering are pure, so they are tested directly; the
 command functions themselves read the environment and open a connection, and
@@ -125,3 +125,29 @@ def test_the_no_transitive_flag_reaches_the_library(monkeypatch: pytest.MonkeyPa
     cli.group_command("Engineers", transitive=False)
 
     assert called == [("Engineers", True), ("Engineers", False)]
+
+
+def test_the_cost_center_subcommand_takes_one_cost_center():
+    assert parse("cost-center", "1234").cost_center == "1234"
+
+
+def test_the_cost_center_subcommand_names_no_attribute(monkeypatch: pytest.MonkeyPatch):
+    """Which attribute holds a cost center is the AttributeMap's answer and not
+    the CLI's (DESIGN §5.2), so the subcommand passes the value as the criterion
+    and nothing else."""
+    called: list[dict[str, object]] = []
+
+    class Recorder:
+        def __init__(self, config, *args, **kwargs) -> None:
+            pass
+
+        def find_users(self, **criteria: object) -> list[User]:
+            called.append(criteria)
+            return []
+
+    configured_env(monkeypatch)
+    monkeypatch.setattr(cli, "LDAPSearch", Recorder)
+
+    cli.cost_center_command("1234")
+
+    assert called == [{"cost_center": "1234"}]
