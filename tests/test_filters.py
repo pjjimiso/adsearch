@@ -2,14 +2,20 @@ import pytest
 
 from adsearch.errors import LDAPQueryError
 from adsearch.filters import (
-    USER_OBJECT,
+    BIT_AND,
+    attr,
     IN_CHAIN,
+    NOT_DISABLED,
+    USER_OBJECT,
+    contains,
     esc,
     is_valid_attr,
     eq,
     all_of,
     any_of,
+    none_of,
     valid_dn,
+    valid_fragment,
     eq_dn,
     in_chain,
 )
@@ -25,6 +31,16 @@ def test_attr_filter():
     assert not is_valid_attr('cn*')
     assert not is_valid_attr('cn\n')
     assert not is_valid_attr('')
+
+
+def test_attr_raises_on_a_name_that_is_not_one():
+    """DESIGN §13. Escaping covers values and not names, so the name is the
+    second injection point and gets its own allowlist."""
+    assert attr('cn') == 'cn'
+    with pytest.raises(LDAPQueryError):
+        attr('cn)(x')
+    with pytest.raises(LDAPQueryError):
+        attr('')
 
 
 def test_eq_filter():
@@ -93,3 +109,34 @@ def test_in_chain():
 def test_in_chain_invalid_attr():
     with pytest.raises(LDAPQueryError):
         in_chain('invalid*', "DC=com")
+
+
+def test_contains_wraps_the_wildcards_around_an_escaped_value():
+    """DESIGN §7.2: the wildcards are ours, the value is escaped."""
+    assert contains('displayName', 'Bob') == '(displayName=*Bob*)'
+    assert contains('displayName', '*') == r'(displayName=*\2a*)'
+    with pytest.raises(LDAPQueryError):
+        contains('display*Name', 'Bob')
+
+
+def test_none_of_negates_a_clause():
+    assert none_of(eq('cn', 'Billy Bob')) == '(!(cn=Billy Bob))'
+
+
+def test_not_disabled_reads_the_account_control_bit():
+    """The user account control attribute is the right one for enabled state,
+    read with the bitwise matching rule — and the wrong one for worker type."""
+    assert NOT_DISABLED == f'(!(userAccountControl:{BIT_AND}:=2))'
+
+
+def test_valid_fragment_accepts_a_well_formed_filter():
+    assert valid_fragment('(title=Director)') == '(title=Director)'
+    assert valid_fragment('(|(a=1)(b=2))') == '(|(a=1)(b=2))'
+
+
+def test_valid_fragment_rejects_a_typo_locally():
+    """DESIGN §7.2: extra_filter is a raw passthrough, sanity-checked so that a
+    typo fails here rather than at the domain controller."""
+    for typo in ('title=Director', '(title=Director', '(a=1))(b=2', '', '()'):
+        with pytest.raises(LDAPQueryError):
+            valid_fragment(typo)

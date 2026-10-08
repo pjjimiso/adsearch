@@ -43,11 +43,17 @@ from adsearch.errors import (
     NotFoundError,
 )
 from adsearch.filters import (
-    USER_OBJECT, 
-    eq, 
+    NOT_DISABLED,
+    USER_OBJECT,
     all_of,
     any_of,
+    contains,
+    eq,
+    attr,
     eq_dn,
+    in_chain,
+    valid_dn,
+    valid_fragment,
 )
 
 
@@ -200,6 +206,7 @@ class LDAPSearch:
         search_filter: str,
         attributes: Sequence[str],
         *,
+        base: str | None = None,
         limit: int | None = None,
     ) -> list[dict]:
         """Runs a paged subtree search and returns at most `limit` raw entries.
@@ -211,11 +218,12 @@ class LDAPSearch:
 
         `limit` stops consuming that generator rather than trimming a finished
         list, so the pages behind it are never fetched (§8.3)."""
+        search_base = self._config.base_dn if base is None else base
         # Debug only: filter values carry names and employee IDs (§7.4).
-        logger.debug("search base=%s filter=%s", self._config.base_dn, search_filter)
+        logger.debug("search base=%s filter=%s", search_base, search_filter)
         with translated():
             response = self.conn.extend.standard.paged_search(
-                search_base=self._config.base_dn,
+                search_base=search_base,
                 search_filter=search_filter,
                 attributes=attributes,
                 search_scope=SUBTREE,
@@ -230,18 +238,87 @@ class LDAPSearch:
         return results
 
 
-    def _search_users(self, search_filter: str) -> list[User]:
-        entries = self._search(search_filter, self._attrs.fetch_attributes())
+    def _search_users(
+        self,
+        search_filter: str,
+        *,
+        base: str | None = None,
+        attributes: Sequence[str] | None = None,
+        limit: int | None = None,
+    ) -> list[User]:
+        entries = self._search(
+            search_filter, self._requested_attributes(attributes), base=base, limit=limit
+        )
         users = []
         for entry in entries:
             users.append(to_user(entry, self._attrs))
         return users
 
 
-    def find_users(self, employee_id: str) -> list[User]:
-        """Look up users by employee ID. Returns a list of User objects."""
-        search_filter = all_of(USER_OBJECT, eq(self._attrs.employee_id, employee_id))
-        return self._search_users(search_filter)
+    def _requested_attributes(self, requested: Sequence[str] | None) -> list[str]:
+        """The attribute map's own attributes, plus any the caller asked for.
+        Additive rather than a replacement (§8.5)."""
+        attributes = self._attrs.fetch_attributes()
+        if requested is None:
+            return attributes
+        return list(dict.fromkeys(attributes + [attr(name) for name in requested]))
+
+
+    def _name_clause(self, fragment: str) -> str:
+        """A fragment matches either name attribute (§8.5)."""
+        return any_of(
+            contains(self._attrs.name, fragment),
+            contains(self._attrs.cn, fragment),
+        )
+
+
+    def _group_clause(self, group_dn: str, transitive: bool) -> str:
+        """Membership of one group, optionally through nested groups."""
+        if transitive:
+            return in_chain(self._attrs.member_of, group_dn)
+        return eq_dn(self._attrs.member_of, group_dn)
+
+
+    def find_users(
+        self,
+        *,
+        employee_id: str | None = None,
+        username: str | None = None,
+        name_contains: str | None = None,
+        cost_center: str | None = None,
+        manager_dn: str | None = None,
+        group_dn: str | None = None,
+        transitive: bool = False,
+        include_disabled: bool = False,
+        base_dn: str | None = None,
+        extra_filter: str | None = None,
+        attributes: Sequence[str] | None = None,
+        limit: int | None = None,
+    ) -> list[User]:
+        """Every user matching all of the criteria supplied, as a list (§8.5).
+
+        The criteria are spelled out rather than taken as `**criteria` so that a
+        mistyped name raises. `manager_dn` is direct reports only (§8.7)."""
+        clauses = [
+            USER_OBJECT,
+            None if include_disabled else NOT_DISABLED,
+            None if employee_id is None else eq(self._attrs.employee_id, employee_id),
+            None if username is None else eq(self._attrs.username, username),
+            None if name_contains is None else self._name_clause(name_contains),
+            None if cost_center is None else eq(self._attrs.cost_center, cost_center),
+            None if manager_dn is None else eq_dn(self._attrs.manager, manager_dn),
+            None if group_dn is None else self._group_clause(group_dn, transitive),
+            # Trusted input by design, and sanity-checked so a typo fails here
+            # rather than at the domain controller (§7.2).
+            None if extra_filter is None else valid_fragment(extra_filter),
+        ]
+        return self._search_users(
+            all_of(*clauses),
+            # The search base is escaped by nothing, so it is validated (§7.2).
+            base=None if base_dn is None else valid_dn(base_dn),
+            attributes=attributes,
+            limit=limit,
+        )
 
 
     def resolve_user_dn(self, value: str, *, by: str | None = None) -> str: 
@@ -299,10 +376,4 @@ class LDAPSearch:
             level = [report["dn"] for report in new]
 
         return tree
-
-
-#   We'll re-implement this later after building out find_users more
-#    def by_employee_id(self, employee_id: str) -> list[Userg:
-#        """Look up a list of users by employee ID""
-#        return self.find_users(employee_id)
 

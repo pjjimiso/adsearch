@@ -16,7 +16,7 @@ from dataclasses import replace
 
 import pytest
 
-from adsearch.errors import NotFoundError
+from adsearch.errors import LDAPQueryError, NotFoundError
 
 from tests.conftest import (
     ANN,
@@ -28,7 +28,7 @@ from tests.conftest import (
     searcher_for,
     searcher_with_connection,
 )
-from tests.fake_directory import Entry, FakeDirectory, reports_to, user
+from tests.fake_directory import Entry, FakeDirectory, group, reports_to, user
 
 DI = f"CN=Di Pu,OU=Users,{BASE_DN}"
 
@@ -100,7 +100,7 @@ def test_find_users_searches_on_employee_id():
         user(ANN, sAMAccountName="alee", employeeID="123"),
         user(BO, sAMAccountName="bng", employeeID="456"),
     )
-    assert usernames(ad.find_users("123")) == ["alee"]
+    assert usernames(ad.find_users(employee_id="123")) == ["alee"]
 
 
 def test_an_employee_id_matching_several_entries_returns_all_of_them():
@@ -109,7 +109,7 @@ def test_an_employee_id_matching_several_entries_returns_all_of_them():
         user(ANN, sAMAccountName="alee", employeeID="123"),
         user(BO, sAMAccountName="bng", employeeID="123"),
     )
-    assert usernames(ad.find_users("123")) == ["alee", "bng"]
+    assert usernames(ad.find_users(employee_id="123")) == ["alee", "bng"]
 
 
 def test_referrals_are_not_returned_as_users():
@@ -230,7 +230,7 @@ def test_context_manager_releases_the_connection_on_exit():
 
     with ad as opened:
         assert opened is ad
-        opened.find_users("123")
+        opened.find_users(employee_id="123")
 
     assert connection.bound is False
 
@@ -262,7 +262,7 @@ def test_search_filter_values_are_logged_at_debug_and_nothing_higher(caplog: pyt
     only ever surface at debug."""
     ad = searcher(user(ANN, sAMAccountName="alee", employeeID="123"))
     with caplog.at_level(logging.DEBUG, logger="adsearch.search"):
-        ad.find_users("123")
+        ad.find_users(employee_id="123")
 
     assert caplog.records
     assert any("123" in record.getMessage() for record in caplog.records)
@@ -325,3 +325,183 @@ def test_referrals_do_not_count_against_the_cap():
     )
     with pytest.raises(NotFoundError, match="More than one"):
         ad.resolve_user_dn("alee")
+
+
+# --- The search contract (DESIGN §8.5) ---------------------------------------
+
+
+GROUP = f"CN=Engineers,OU=Groups,{BASE_DN}"
+PARENT_GROUP = f"CN=All Staff,OU=Groups,{BASE_DN}"
+
+
+def test_a_mistyped_criterion_raises_rather_than_widening_the_query():
+    """The whole reason the criteria are spelled out rather than taken as
+    **kwargs: with **kwargs this call returns the entire directory. The type
+    checker objects to the typo for the same reason, one step earlier."""
+    ad = searcher(user(ANN, sAMAccountName="alee"))
+    with pytest.raises(TypeError):
+        ad.find_users(manager_dm=ANN)  # type: ignore[call-arg]
+
+
+def test_every_criterion_narrows_on_its_own():
+    directory = [
+        user(ANN, sAMAccountName="alee", displayName="Ann Lee", employeeID="123",
+             departmentNumber="CC1", manager=BO, member_of=[GROUP]),
+        user(BO, sAMAccountName="bng", displayName="Bo Ng", employeeID="456",
+             departmentNumber="CC2"),
+    ]
+    ad = searcher(*directory)
+
+    assert usernames(ad.find_users(employee_id="123")) == ["alee"]
+    assert usernames(ad.find_users(username="alee")) == ["alee"]
+    assert usernames(ad.find_users(name_contains="nn L")) == ["alee"]
+    assert usernames(ad.find_users(cost_center="CC1")) == ["alee"]
+    assert usernames(ad.find_users(manager_dn=BO)) == ["alee"]
+    assert usernames(ad.find_users(group_dn=GROUP)) == ["alee"]
+    assert usernames(ad.find_users(extra_filter="(title=Boss)")) == []
+
+
+def test_supplied_criteria_compose_with_logical_and():
+    """Both criteria hold for nobody, though each holds for somebody."""
+    ad = searcher(
+        user(ANN, sAMAccountName="alee", employeeID="123", departmentNumber="CC1"),
+        user(BO, sAMAccountName="bng", employeeID="456", departmentNumber="CC2"),
+    )
+    assert usernames(ad.find_users(employee_id="123", cost_center="CC1")) == ["alee"]
+    assert ad.find_users(employee_id="123", cost_center="CC2") == []
+
+
+def test_a_name_fragment_matches_the_common_name_when_no_display_name_is_set():
+    """DESIGN §5.2: displayName is not guaranteed populated and cn always is, so
+    a fragment search that read only displayName would quietly miss people."""
+    ad = searcher(user(ANN, sAMAccountName="alee", cn="Ann Lee"))
+    assert usernames(ad.find_users(name_contains="Ann")) == ["alee"]
+
+
+def test_a_caller_supplied_wildcard_does_not_widen_a_name_fragment():
+    """DESIGN §7.2: the wildcards belong to the library, never to the caller."""
+    ad = searcher(user(ANN, sAMAccountName="alee", displayName="Ann Lee"))
+    assert ad.find_users(name_contains="*") == []
+
+
+def test_a_manager_dn_criterion_is_one_hop_and_not_a_traversal():
+    """DESIGN §8.7: a traversal is several queries and cannot compose into one,
+    so the criterion form is direct reports only. dpu reports to bng."""
+    directory = RecordingDirectory(
+        user(ANN, sAMAccountName="alee"),
+        user(BO, sAMAccountName="bng", manager=ANN),
+        user(CY, sAMAccountName="coh", manager=ANN),
+        user(DI, sAMAccountName="dpu", manager=BO),
+    )
+    ad, _connection = searcher_for(directory)
+
+    assert usernames(ad.find_users(manager_dn=ANN)) == ["bng", "coh"]
+    assert len(directory.filters) == 1, "a criterion is one query, not a walk"
+
+
+def test_a_group_criterion_is_direct_membership_unless_asked_to_be_transitive():
+    ad = searcher(
+        user(ANN, sAMAccountName="alee", member_of=[GROUP]),
+        group(GROUP, member_of=[PARENT_GROUP]),
+        group(PARENT_GROUP),
+        user(BO, sAMAccountName="bng", member_of=[PARENT_GROUP]),
+    )
+    assert usernames(ad.find_users(group_dn=PARENT_GROUP)) == ["bng"]
+    assert usernames(ad.find_users(group_dn=PARENT_GROUP, transitive=True)) == ["alee", "bng"]
+
+
+def test_disabled_accounts_are_excluded_unless_requested():
+    ad = searcher(
+        user(ANN, sAMAccountName="alee"),
+        user(BO, sAMAccountName="bng", disabled=True),
+    )
+    assert usernames(ad.find_users()) == ["alee"]
+    assert usernames(ad.find_users(include_disabled=True)) == ["alee", "bng"]
+
+
+def test_an_empty_result_is_an_empty_list_rather_than_an_error():
+    ad = searcher(user(ANN, sAMAccountName="alee", employeeID="123"))
+    assert ad.find_users(employee_id="nobody") == []
+
+
+def test_results_are_a_list_so_a_failure_surfaces_at_the_call_site():
+    """DESIGN §8.5: an iterator would raise inside the caller's loop instead."""
+    ad = searcher(user(ANN, sAMAccountName="alee"))
+    assert isinstance(ad.find_users(), list)
+
+
+def test_the_search_base_can_be_narrowed_for_one_query():
+    contractors = f"OU=Contractors,{BASE_DN}"
+    ad = searcher(
+        user(ANN, sAMAccountName="alee"),
+        user(f"CN=Zed Ox,{contractors}", sAMAccountName="zox"),
+    )
+    assert usernames(ad.find_users(base_dn=contractors)) == ["zox"]
+
+
+def test_a_malformed_search_base_raises_rather_than_reaching_the_directory():
+    """DESIGN §7.2: escape_filter_chars does not touch the search base, so the
+    base is the vector guarded by valid_dn rather than by escaping."""
+    ad = searcher(user(ANN, sAMAccountName="alee"))
+    with pytest.raises(LDAPQueryError):
+        ad.find_users(base_dn="not a dn")
+
+
+def test_a_raw_filter_fragment_composes_with_the_named_criteria():
+    ad = searcher(
+        user(ANN, sAMAccountName="alee", title="Director"),
+        user(BO, sAMAccountName="bng", title="Engineer"),
+    )
+    assert usernames(ad.find_users(extra_filter="(title=Director)")) == ["alee"]
+    assert ad.find_users(username="bng", extra_filter="(title=Director)") == []
+
+
+def test_a_malformed_filter_fragment_fails_locally():
+    ad = searcher(user(ANN, sAMAccountName="alee"))
+    with pytest.raises(LDAPQueryError):
+        ad.find_users(extra_filter="title=Director")
+
+
+def test_a_requested_attribute_is_available_on_a_returned_user():
+    ad = searcher(user(ANN, sAMAccountName="alee", extensionAttribute7="WIDGETS"))
+    found = ad.find_users(username="alee", attributes=["extensionAttribute7"])
+    assert found[0]["attributes"]["extensionAttribute7"] == ["WIDGETS"]
+
+
+def test_requesting_attributes_does_not_cost_the_mapped_fields():
+    """A narrowed attribute list would leave `name` falling back to the DN and
+    `username` None — a User that looks populated and is not."""
+    ad = searcher(
+        user(ANN, sAMAccountName="alee", displayName="Ann Lee", extensionAttribute7="WIDGETS")
+    )
+    found = ad.find_users(username="alee", attributes=["extensionAttribute7"])
+    assert found[0]["name"] == "Ann Lee"
+    assert found[0]["username"] == "alee"
+
+
+def test_a_malformed_attribute_name_raises():
+    ad = searcher(user(ANN, sAMAccountName="alee"))
+    with pytest.raises(LDAPQueryError):
+        ad.find_users(username="alee", attributes=["extension)(objectClass=*"])
+
+
+def test_a_result_cap_stops_the_generator_rather_than_trimming_a_finished_list():
+    directory = FakeDirectory(*[
+        user(f"CN=User {i},OU=Users,{BASE_DN}", sAMAccountName=f"u{i}") for i in range(10)
+    ])
+    ad, _connection = searcher_for(directory)
+
+    assert len(ad.find_users(limit=3)) == 3
+    assert directory.consumed == 3
+
+
+def test_the_disabled_exclusion_stops_at_the_criterion():
+    """DESIGN §8.5: the default is `find_users`'s, not the library's. The
+    traversal wrappers have no criteria to opt out with, so they still return a
+    disabled report — recorded here so the asymmetry cannot drift unnoticed."""
+    entries = (
+        user(ANN, sAMAccountName="alee"),
+        user(BO, sAMAccountName="bng", manager=ANN, disabled=True),
+    )
+    assert searcher(*entries).find_users(manager_dn=ANN) == []
+    assert usernames(searcher(*entries).direct_reports("alee")) == ["bng"]

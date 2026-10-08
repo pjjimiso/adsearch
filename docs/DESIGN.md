@@ -297,7 +297,7 @@ is the one place a site corrects reality without editing code.
 
 `extra` is a tuple rather than a list because a frozen dataclass with a mutable default is a defect.
 
-`fetch_list()` returns every attribute name to request on a user search, including `extra`.
+`fetch_attributes()` returns every attribute name to request on a user search, including `extra`.
 
 **No `is_bluebadge`, `bluebadge_values`, or `contractor_upn_suffixes`.** That classification is the
 consumer's (§1.4). Recorded so it is not rediscovered: the plausible candidates at a given site are
@@ -467,6 +467,7 @@ in_chain(a, dn)     # (attr:1.2.840.113556.1.4.1941:=dn) — transitive match
 all_of(*clauses)    # AND-combine, dropping Nones; raises rather than emitting empty
 any_of(*clauses)    # OR-combine
 none_of(clause)     # (!clause)
+valid_fragment(f)   # reject a raw filter fragment that is not one balanced clause
 
 USER_OBJECT  = "(&(objectCategory=person)(objectClass=user))"
 NOT_DISABLED = "(!(userAccountControl:1.2.840.113556.1.4.803:=2))"
@@ -625,15 +626,47 @@ difference between a crash and a quiet breach.
 during consumption. Were `find_users` to return an iterator, an authentication or query failure would
 surface inside the caller's loop — after partial results, in a frame with no error handling, in a
 different repository. Returning a list forces the exception back to the call site. Secondarily, most
-consumers need `len()`, sorting, or `json.dumps`, all of which materialize anyway. `iter_users`
-remains as a documented escape hatch for streaming.
+consumers need `len()`, sorting, or `json.dumps`, all of which materialize anyway.
 
 All criteria **AND**-compose. Callers needing OR loop a wrapper or build `any_of(...)` and pass it as
 `extra_filter`.
 
 Disabled accounts are excluded by default, with `include_disabled=True` to opt in. The flag exists
 rather than being hardcoded because "a disabled account still in a privileged group" is itself an
-audit finding.
+audit finding. Enabled state is read from `userAccountControl` with the bitwise matching rule
+(`NOT_DISABLED`, §7.2), the disable flag being one bit inside an integer rather than the whole value.
+This is not in tension with §5.2's refusal of that attribute: enabled state is the one question it
+answers correctly, and worker type is the question it says nothing about.
+
+The exclusion is **`find_users`'s, not the library's**. `direct_reports` and `reporting_tree` (§8.7)
+return disabled accounts, having no criteria to opt out with; a caller wanting the traversal filtered
+passes the manager DN to `find_users` instead, or filters the returned list. The asymmetry is
+recorded rather than defended — it is worth revisiting when the wrappers next change.
+
+`manager_dn` is **direct reports only**. A reporting tree is several queries and so cannot compose
+into a filter at all (§8.7); the criterion form exists for the one-hop question, and `group_dn`
+likewise defaults to direct membership, with `transitive=True` following `memberOf` through nested
+groups. The opposite default of §8.8 belongs to the group wrapper, which asks "who actually holds
+this access"; a raw criterion reports the directory as it stands.
+
+`name_contains` is a substring match over **both** name attributes — `(|(displayName=*x*)(cn=*x*))` —
+for the reason §5.2 gives for the mapper's own fallback: `displayName` is not guaranteed populated and
+`cn` always is, so a fragment search reading only the first quietly misses people. The wildcards are
+the library's; the caller's value is escaped, so a supplied `*` narrows to nothing rather than
+widening to everything (§7.2).
+
+`base_dn` replaces the search base for one query — scoping a search to a single organizational unit
+is what it is for, though nothing constrains it to sit *under* `LDAPConfig.base_dn`. It is validated
+with `valid_dn()` rather than escaped, because `escape_filter_chars` does not touch a search base
+(§7.2). `extra_filter` is checked
+for shape only. `attributes` **adds to** the attribute map's own list rather than replacing it: a
+narrowed list would leave `name` falling back to the DN and `username` as `None` on a `User` that
+still looks populated, which is §8.3's resembles-success failure in a third guise. `limit` is the
+result cap of §8.3, stopping the generator rather than trimming a finished list.
+
+`find_users()` with no criteria is a legal, deliberate whole-directory query. The typo guarded against
+above cannot arrive here by accident, an unknown keyword raising before any filter is built; pairing
+it with `limit` is the cheap exploratory form.
 
 ### 8.6 Named wrappers
 
@@ -701,8 +734,9 @@ group's `member` attribute, for three reasons:
    trips.
 3. `member` includes nested *group* objects, which would have to be recursed manually.
 
-**`transitive=True` is the default here** — the inverse of the reporting-tree stance in §8.7, where
-full depth stays opt-in. The question being asked is "who actually holds this access", and a nested
+**`transitive=True` is the default here** — for the group *wrapper*, which is what asks the question
+below; the raw `group_dn` criterion of §8.5 stays literal, and reports membership as the directory
+records it. This is the inverse of the reporting-tree stance in §8.7, where full depth stays opt-in. The question being asked is "who actually holds this access", and a nested
 group silently hiding members is the wrong answer that matters. The asymmetry is deliberate: it
 follows from which wrong answer is more damaging in each case, not from consistency for its own sake.
 Note that the justification differs too — §8.7 rests on a measurement, this rests on correctness, so
@@ -832,6 +866,16 @@ offline, without a directory.
 - `eq_dn` escapes a DN containing parentheses rather than merely validating it.
 - `attr("cn)(x")` and `valid_dn("not a dn")` raise.
 - `all_of()` raises rather than emitting an empty filter.
+- `contains("displayName", "*")` neutralizes the caller's wildcard while keeping the library's own,
+  so a supplied `*` narrows to nothing rather than widening to everything.
+- `find_users(manager_dm=...)` raises `TypeError` rather than returning the directory.
+- Every criterion narrows on its own, and criteria supplied together compose with AND.
+- A `manager_dn` criterion issues exactly one query and returns direct reports only.
+- A disabled account is absent unless `include_disabled=True`, and an entry carrying no
+  `userAccountControl` at all is not excluded by the check.
+- A `find_users` result is a `list`, and an empty result is `[]` rather than an error.
+- A malformed `base_dn`, filter fragment or requested attribute name raises before the query is sent.
+- Requesting attributes leaves the attribute map's own fields populated on the returned `User`.
 - The constructed `Server.tls.validate` is `ssl.CERT_REQUIRED`.
 - `LDAPConfig` with SIMPLE bind and `use_ssl=False` raises `LDAPConfigError`.
 - `LDAPConfig.from_env({})` raises `LDAPConfigError` — proving no baked-in server default.
@@ -864,8 +908,9 @@ offline, without a directory.
   than mitigating it with TLS, at the cost of a more complex `LDAPConfig` and a platform dependency.
 - **Single server, no failover.** `LDAPConfig.server` is one URI; multi-DC failover would interact
   with the one-bind-per-instance decision in §8.1.
-- **`extra_filter` is an unvalidated passthrough** by design (§7.2). It is the one place a caller can
-  construct arbitrary filter syntax, and it is documented as trusted-input-only.
+- **`extra_filter` is an uninterpreted passthrough** by design (§7.2). `valid_fragment` checks its
+  shape — one balanced, parenthesised clause — and nothing about its meaning, so it remains the one
+  place a caller can construct arbitrary filter syntax, and it is documented as trusted-input-only.
 - **Development occurs above the declared Python floor** (§11), so 3.12 compatibility requires an
   explicit check rather than being continuously exercised.
 

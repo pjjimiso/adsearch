@@ -8,10 +8,22 @@ import pytest
 
 from ldap3 import NO_ATTRIBUTES
 
-from adsearch.filters import USER_OBJECT, all_of, any_of, eq, eq_dn, in_chain
+from adsearch.filters import (
+    BIT_AND,
+    NOT_DISABLED,
+    USER_OBJECT,
+    all_of,
+    any_of,
+    contains,
+    eq,
+    eq_dn,
+    in_chain,
+    none_of,
+)
 
 from tests.conftest import ANN, BASE_DN, BO
 from tests.fake_directory import (
+    Entry,
     FakeDirectory,
     FilterSyntaxError,
     group,
@@ -175,3 +187,49 @@ def test_a_disjunction_wider_than_a_batch_matches_every_clause():
     batch = [eq_dn("manager", report.dn) for report in level[:500]]
     found = directory.search(BASE_DN, all_of(USER_OBJECT, any_of(*batch)))
     assert len(found) == 500
+
+
+def test_a_substring_filter_matches_a_fragment_of_a_value():
+    directory = FakeDirectory(user(ANN, displayName="Ann Lee"), user(BO, displayName="Bo Ng"))
+    assert dns(directory.search(BASE_DN, contains("displayName", "nn L"))) == [ANN]
+    assert dns(directory.search(BASE_DN, contains("displayName", "ann lee"))) == [ANN]
+
+
+def test_a_substring_filter_does_not_match_a_neutralised_wildcard():
+    """The library's own '*' characters are structural; the caller's are four
+    escaped characters and must stay literal."""
+    directory = FakeDirectory(user(ANN, displayName="Ann Lee"))
+    assert directory.search(BASE_DN, contains("displayName", "*")) == []
+
+
+def test_negation_excludes_what_the_clause_matches():
+    directory = FakeDirectory(user(ANN, sAMAccountName="alee"), user(BO, sAMAccountName="bng"))
+    assert dns(directory.search(BASE_DN, none_of(eq("sAMAccountName", "alee")))) == [BO]
+
+
+def test_the_bitwise_rule_reads_one_flag_out_of_an_integer():
+    """512 is a normal enabled account, 514 the same account disabled: the
+    disable bit is one flag inside the value, never the value itself."""
+    directory = FakeDirectory(
+        user(ANN, userAccountControl="512"),
+        user(BO, userAccountControl="514"),
+    )
+    assert dns(directory.search(BASE_DN, f"(userAccountControl:{BIT_AND}:=2)")) == [BO]
+
+
+def test_a_fake_user_is_enabled_unless_asked_otherwise():
+    directory = FakeDirectory(user(ANN), user(BO, disabled=True))
+    assert dns(directory.search(BASE_DN, NOT_DISABLED)) == [ANN]
+
+
+def test_an_entry_without_account_control_is_not_excluded_by_the_disable_check():
+    """An absent attribute matches nothing, so the negation passes it — which
+    is what a real directory does and what keeps older fixtures honest."""
+    directory = FakeDirectory(Entry(dn=ANN, attributes={"objectCategory": ["person"]}))
+    assert dns(directory.search(BASE_DN, NOT_DISABLED)) == [ANN]
+
+
+def test_an_unsupported_matching_rule_is_an_error_not_a_silent_match():
+    directory = FakeDirectory(user(ANN))
+    with pytest.raises(FilterSyntaxError):
+        directory.search(BASE_DN, "(memberOf:1.2.3.4:=CN=x,DC=y)")

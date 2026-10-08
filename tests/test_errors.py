@@ -145,7 +145,7 @@ def fails_at(site: Site, error: Exception) -> None:
     if site == "bind":
         unbindable(error).conn
     else:
-        searcher(*DIRECTORY, failure=Failure(error, during=site)).find_users("123")
+        searcher(*DIRECTORY, failure=Failure(error, during=site)).find_users(employee_id="123")
 
 
 def test_the_two_exception_hierarchies_are_disjoint():
@@ -194,11 +194,11 @@ def test_a_failure_partway_through_a_result_stream_raises_rather_than_returning_
     dangerous failure here. The fake raises only after yielding every match, so
     `_search` has a complete-looking list of one user when the error arrives,
     which is what the first assertion proves."""
-    assert len(searcher(*DIRECTORY).find_users("123")) == 1
+    assert len(searcher(*DIRECTORY).find_users(employee_id="123")) == 1
 
     ad = searcher(*DIRECTORY, failure=Failure(size_limit(), during="iteration"))
     with pytest.raises(LDAPQueryError):
-        ad.find_users("123")
+        ad.find_users(employee_id="123")
 
 
 @pytest.mark.parametrize(
@@ -212,7 +212,7 @@ def test_the_boundary_does_not_over_catch(error):
     `NotFoundError` — or a plain bug in this library — as a query error."""
     ad = searcher(*DIRECTORY, failure=Failure(error, during="call"))
     with pytest.raises(type(error)):
-        ad.find_users("123")
+        ad.find_users(employee_id="123")
 
 
 # --- No third-party exception escapes any public operation -------------------
@@ -220,7 +220,7 @@ def test_the_boundary_does_not_over_catch(error):
 OPERATIONS = {
     "conn": lambda ad: ad.conn,
     "close": lambda ad: ad.close(),
-    "find_users": lambda ad: ad.find_users("123"),
+    "find_users": lambda ad: ad.find_users(employee_id="123"),
     "resolve_user_dn": lambda ad: ad.resolve_user_dn("alee"),
     "direct_reports": lambda ad: ad.direct_reports("alee"),
     "reporting_tree": lambda ad: ad.reporting_tree("alee"),
