@@ -17,6 +17,7 @@ from dataclasses import replace
 import pytest
 
 from adsearch.errors import LDAPQueryError, NotFoundError
+from adsearch.models import AttributeMap
 
 from tests.conftest import (
     ANN,
@@ -369,6 +370,19 @@ def test_supplied_criteria_compose_with_logical_and():
     )
     assert usernames(ad.find_users(employee_id="123", cost_center="CC1")) == ["alee"]
     assert ad.find_users(employee_id="123", cost_center="CC2") == []
+
+
+def test_a_cost_center_search_keys_on_whichever_attribute_the_map_names():
+    """DESIGN §5.2: `departmentNumber` is a low-confidence guess, so the
+    criterion filters on whatever a site corrected it to. bng carries the
+    default, and is who a search still reading it would return."""
+    site = AttributeMap(cost_center="extensionAttribute3")
+    ad = searcher(
+        user(ANN, sAMAccountName="alee", extensionAttribute3="CC1"),
+        user(BO, sAMAccountName="bng", departmentNumber="CC1"),
+        attrs=site,
+    )
+    assert usernames(ad.find_users(cost_center="CC1")) == ["alee"]
 
 
 def test_a_name_fragment_matches_the_common_name_when_no_display_name_is_set():
