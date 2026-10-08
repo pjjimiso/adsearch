@@ -6,6 +6,7 @@ from adsearch.filters import (
     attr,
     IN_CHAIN,
     NOT_DISABLED,
+    GROUP_OBJECT,
     USER_OBJECT,
     contains,
     esc,
@@ -14,6 +15,7 @@ from adsearch.filters import (
     all_of,
     any_of,
     none_of,
+    is_dn,
     valid_dn,
     valid_fragment,
     eq_dn,
@@ -140,3 +142,25 @@ def test_valid_fragment_rejects_a_typo_locally():
     for typo in ('title=Director', '(title=Director', '(a=1))(b=2', '', '()'):
         with pytest.raises(LDAPQueryError):
             valid_fragment(typo)
+
+
+def test_a_distinguished_name_is_told_apart_from_a_common_name():
+    """What decides whether `resolve_group_dn` searches or takes its argument
+    at face value (DESIGN §8.6)."""
+    assert is_dn("CN=Engineers,OU=Groups,DC=test,DC=com")
+    assert is_dn("CN=Team (West),OU=Groups,DC=test,DC=com")
+    assert not is_dn("Engineers")
+    assert not is_dn("Some Group Name")
+    assert not is_dn("")
+
+
+def test_a_name_containing_an_equals_sign_reads_as_a_distinguished_name():
+    """The sharp edge of the rule above, pinned rather than hidden: a group
+    whose common name contains `=` must be passed as a DN."""
+    assert is_dn("Team=West")
+
+
+def test_the_group_object_filter_names_the_category_only():
+    """DESIGN §8.6 specifies `(&(objectCategory=group)(cn=...))`. Unlike a user,
+    a group needs no object-class clause to be unambiguous."""
+    assert GROUP_OBJECT == "(objectCategory=group)"

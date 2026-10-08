@@ -16,6 +16,14 @@ def parse(*argv: str):
     return build_parser().parse_args(argv)
 
 
+def configured_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The two variables `LDAPConfig.from_env` requires, and no credentials."""
+    monkeypatch.setenv("ADSEARCH_SERVER", "ldaps://dc.test.com")
+    monkeypatch.setenv("ADSEARCH_BASE_DN", "DC=test,DC=com")
+    monkeypatch.delenv("ADSEARCH_BIND_USER", raising=False)
+    monkeypatch.delenv("ADSEARCH_BIND_PASSWORD", raising=False)
+
+
 def bo() -> User:
     return User(
         dn="CN=Bo Ng,OU=Users,DC=test,DC=com",
@@ -72,13 +80,48 @@ def test_the_flag_chooses_which_library_operation_is_called(monkeypatch: pytest.
             called.append(("reporting_tree", username))
             return []
 
-    monkeypatch.setenv("ADSEARCH_SERVER", "ldaps://dc.test.com")
-    monkeypatch.setenv("ADSEARCH_BASE_DN", "DC=test,DC=com")
-    monkeypatch.delenv("ADSEARCH_BIND_USER", raising=False)
-    monkeypatch.delenv("ADSEARCH_BIND_PASSWORD", raising=False)
+    configured_env(monkeypatch)
     monkeypatch.setattr(cli, "LDAPSearch", Recorder)
 
     cli.manager_command("jdoe")
     cli.manager_command("jdoe", all_reports=True)
 
     assert called == [("direct_reports", "jdoe"), ("reporting_tree", "jdoe")]
+
+
+def test_the_group_subcommand_takes_a_name_or_a_dn():
+    """Either form reaches the library unchanged; which one it is, is the
+    library's question to ask and not the parser's."""
+    assert parse("group", "Some Group Name").group == "Some Group Name"
+    dn = "CN=Engineers,OU=Groups,DC=test,DC=com"
+    assert parse("group", dn).group == dn
+
+
+def test_the_group_subcommand_parses_as_transitive_unless_restricted():
+    """DESIGN §10: the flag is subcommand-scoped because it selects between two
+    questions about the group, not between two output shapes."""
+    assert parse("group", "Some Group Name").transitive is True
+    assert parse("group", "Some Group Name", "--no-transitive").transitive is False
+
+
+def test_the_no_transitive_flag_reaches_the_library(monkeypatch: pytest.MonkeyPatch):
+    """Both arms call one method, so what the flag decides is the argument —
+    and a flag parsed but not passed through would leave every other test in
+    this file green."""
+    called: list[tuple[str, bool]] = []
+
+    class Recorder:
+        def __init__(self, config, *args, **kwargs) -> None:
+            pass
+
+        def by_group(self, group: str, *, transitive: bool = True) -> list[User]:
+            called.append((group, transitive))
+            return []
+
+    configured_env(monkeypatch)
+    monkeypatch.setattr(cli, "LDAPSearch", Recorder)
+
+    cli.group_command("Engineers")
+    cli.group_command("Engineers", transitive=False)
+
+    assert called == [("Engineers", True), ("Engineers", False)]

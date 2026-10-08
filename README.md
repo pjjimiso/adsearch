@@ -101,6 +101,36 @@ with LDAPSearch(LDAPConfig.from_env(), attrs=schema) as ad:
 anywhere, but should still be verified per site — especially `cost_center`, which is very commonly a
 site-specific extension attribute rather than the default `departmentNumber`.
 
+## Group membership
+
+A group is named either by its DN or by the common name a human would use. A name that doesn't parse
+as a DN is searched for under `ADSEARCH_GROUP_BASE_DN` (falling back to `ADSEARCH_BASE_DN`), and a
+name matching more than one group raises `NotFoundError` rather than picking one:
+
+```python
+with LDAPSearch(LDAPConfig.from_env()) as ad:
+    members = ad.by_group("Some Group Name")                      # transitive
+    direct = ad.by_group("Some Group Name", transitive=False)     # direct members only
+    dn = ad.resolve_group_dn("Some Group Name")
+```
+
+**Membership is transitive by default**: anyone who holds the group through a nested group is
+included. This is the opposite of `reporting_tree`, where full depth is opt-in, and the asymmetry is
+deliberate. The question a group answers is "who actually holds this access", and a nested group
+silently hiding a member is the wrong answer that matters in an audit.
+
+Members are found by filtering users on their group-membership attribute rather than by reading the
+group's `member` attribute. Reading `member` would hit Active Directory's cap on multi-valued reads,
+return bare DNs needing a follow-up lookup each, and mix group objects in among the people. The
+search itself is paged, so a group larger than the directory's page size returns every member rather
+than truncating. Disabled accounts are excluded unless you pass `include_disabled=True` — a disabled
+account still in a privileged group is itself an audit finding.
+
+**Caveat: membership implied by `primaryGroupID` is not reflected.** Active Directory stores a user's
+primary group as an integer RID on the user rather than as a membership link, so neither `member` nor
+`memberOf` reports it. In practice this affects only Domain Users and is usually ignorable, but it is
+recorded here so that it isn't rediscovered mid-audit.
+
 ## CLI usage
 
 The console script is a thin wrapper for discovery and debugging:

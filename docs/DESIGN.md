@@ -245,7 +245,7 @@ produces bugs that cannot be reproduced; slotted because it turns field-name typ
 |---|---|---|---|
 | `server` | `str` | **required** | e.g. `ldaps://dc.example.com` |
 | `base_dn` | `str` | **required** | |
-| `group_base_dn` | `str \| None` | `None` | Falls back to `base_dn` when unset |
+| `group_base_dn` | `str \| None` | `None` | Falls back to `base_dn` when unset, via `group_search_base` (§8.6) |
 | `bind_user` | `str \| None` | `None` | Service-account UPN or DN |
 | `bind_password` | `str \| None` | `None` | **`field(repr=False)`** |
 | `use_ssl` | `bool` | `True` | |
@@ -460,6 +460,7 @@ BIT_AND  = "1.2.840.113556.1.4.803"    # LDAP_MATCHING_RULE_BIT_AND
 esc(value)          # RFC 4515 escape of an assertion value
 attr(name)          # validate an attribute NAME against ^[A-Za-z][A-Za-z0-9-]*$
 valid_dn(dn)        # reject anything that is not a well-formed DN; wraps parse_dn
+is_dn(value)        # the same question asked rather than asserted, for DN-or-name arguments
 eq(a, value)        # (attr=value) — exact; a caller-supplied '*' is neutralised
 contains(a, value)  # (attr=*value*) — the wildcards are ours, the value is escaped
 eq_dn(a, dn)        # (attr=dn) — esc(valid_dn(dn)), in that order
@@ -470,11 +471,15 @@ none_of(clause)     # (!clause)
 valid_fragment(f)   # reject a raw filter fragment that is not one balanced clause
 
 USER_OBJECT  = "(&(objectCategory=person)(objectClass=user))"
+GROUP_OBJECT = "(objectCategory=group)"
 NOT_DISABLED = "(!(userAccountControl:1.2.840.113556.1.4.803:=2))"
 ```
 
 `USER_OBJECT` leads with `objectCategory` because it is indexed and single-valued in AD;
-`(objectClass=user)` alone is substantially slower on a large directory.
+`(objectClass=user)` alone is substantially slower on a large directory. `GROUP_OBJECT` needs no
+object-class clause beside it to be unambiguous, and it is not optional: `cn` is populated on every
+entry in a directory, so a group resolve filtering on the name alone would let a person who happens
+to share the group's name resolve as the group.
 
 Four properties of this design are easy to get wrong, and each is handled explicitly:
 
@@ -643,6 +648,11 @@ return disabled accounts, having no criteria to opt out with; a caller wanting t
 passes the manager DN to `find_users` instead, or filters the returned list. The asymmetry is
 recorded rather than defended — it is worth revisiting when the wrappers next change.
 
+`by_group` (§8.8) falls on the other side of that line: it composes into `find_users`, so it excludes
+disabled accounts by default and takes `include_disabled` to opt back in. That is the flag's original
+justification arriving at the operation it was written for, a disabled account still in a privileged
+group being the audit finding named above.
+
 `manager_dn` is **direct reports only**. A reporting tree is several queries and so cannot compose
 into a filter at all (§8.7); the criterion form exists for the one-hop question, and `group_dn`
 likewise defaults to direct membership, with `transitive=True` following `memberOf` through nested
@@ -680,7 +690,20 @@ reachable without a library change.
 `resolve_user_dn` and `resolve_group_dn` are public because they are independently useful and because
 `resolve-dn` is a valuable debugging subcommand. `resolve_group_dn` accepts either a DN or a CN: if
 the argument does not parse as a DN, it searches `(&(objectCategory=group)(cn=<escaped>))` under
-`group_base_dn`, which is what lets callers pass friendly group names.
+`group_base_dn`, which is what lets callers pass friendly group names. That base is
+`LDAPConfig.group_search_base`, which is where §5.1's fallback to `base_dn` lives — one property
+rather than an `or` at each call site, so a later group query cannot forget the fallback. An argument
+that *does* parse as a DN is returned as it came: a DN is already the answer the search would return,
+so resolving one is a round trip spent to learn nothing. The rule costs two things, both recorded
+here rather than discovered later: a group whose common name contains `=` must be passed as a DN, and
+a *mistyped* DN is not caught — it enumerates to `[]`, which §6.3 otherwise forbids a resolve to
+return. Verifying one would mean a query against a base the DN need not sit under, turning a valid
+DN outside `group_base_dn` into a failure, which is the worse of the two wrong answers. The criterion
+form in §8.5 already reports the directory as it stands for the same argument.
+
+Both resolves share one body, which is where §6.3's raise-on-zero-and-on-two lives: a second
+resolve written to return the first of several matches is the failure the shared helper makes
+impossible rather than merely discouraged.
 
 ### 8.7 Manager traversal, and why the reporting tree is walked
 
@@ -879,6 +902,19 @@ offline, without a directory.
 - The constructed `Server.tls.validate` is `ssl.CERT_REQUIRED`.
 - `LDAPConfig` with SIMPLE bind and `use_ssl=False` raises `LDAPConfigError`.
 - `LDAPConfig.from_env({})` raises `LDAPConfigError` — proving no baked-in server default.
+- A group named by common name resolves to one DN; a name matching two groups raises rather than
+  picking one, a fragment of a name resolves to nothing, and a caller-supplied `*` narrows to nothing
+  rather than matching every group.
+- A group named by DN is enumerated without a resolve query.
+- A group name is searched for under `group_base_dn`, and the fallback to `base_dn` widens the scope
+  rather than being cosmetic: the same two same-named groups become ambiguous without it.
+- Group enumeration is transitive by default and direct-only on request, which is the inverse of the
+  reporting tree's default — the one asymmetry a test must hold in place, since both defaults are one
+  keyword apart.
+- A member two groups deep is returned, and the nested group objects that match the same transitive
+  filter are not. A person sharing a group's name does not resolve as the group.
+- Group enumeration asks the directory to page at the configured size and applies no result cap, so
+  a group wider than one page is not truncated to it.
 - A reporting tree containing a management cycle terminates, and a manager is never his own report.
 - A user reachable under two managers within one tree is returned exactly once.
 - A reporting level wider than `LDAPConfig.batch_size` is split across queries, and every report in it
