@@ -736,6 +736,8 @@ entire tree in a single filter, which is what this document originally specified
 against a ~40,000-employee tree put it roughly **600x slower** than walking the tree level by level.
 It is not used. **See [ADR-0001](adr/0001-bfs-over-in-chain.md) for the measurement and the decision;
 the one-line matching-rule call is the regression to guard against, not the shortcut to take.**
+`scripts/benchmark.py` is the harness that reproduces that measurement against a live directory,
+replacing the one that produced the original figure and was deleted (ADR-0001).
 
 The walk is breadth-first: query the manager's direct reports, batch that level's DNs into
 `any_of(eq_dn("manager", d) …)` queries of `LDAPConfig.batch_size` DNs apiece, and repeat until a
@@ -778,7 +780,9 @@ records it. This is the inverse of the reporting-tree stance in §8.7, where ful
 group silently hiding members is the wrong answer that matters. The asymmetry is deliberate: it
 follows from which wrong answer is more damaging in each case, not from consistency for its own sake.
 Note that the justification differs too — §8.7 rests on a measurement, this rests on correctness, so
-an unfavourable group benchmark would change the mechanism here and not the default.
+an unfavourable group benchmark would change the mechanism here and not the default. `scripts/benchmark.py`
+is where that benchmark lives; it is not yet run against a directory large enough to be informative
+(ADR-0001).
 
 Documented caveat: neither `member` nor `memberOf` reflects `primaryGroupID`, which is stored as an
 integer RID on the user rather than as a link. In practice this affects only Domain Users and is
@@ -1042,6 +1046,7 @@ offline, without a directory.
 | `src/adsearch/models.py` | `AttributeMap`, `User` |
 | `src/adsearch/search.py` | Connection lifecycle, the `ldap3` translation boundary (§6.2), paged search core, discovery, resolvers, wrappers |
 | `src/adsearch/cli.py` | argparse, output formatting, exit codes, `getpass`, `basicConfig` |
+| `scripts/benchmark.py` | Benchmark harness: the manager-traversal and group-membership comparisons of ADR-0001, and the filter-complexity probe. Requires a live directory; not packaged in the wheel |
 | `tests/conftest.py` | The offline guard — no test opens a socket — the fake-backed `searcher` helpers, and `unbindable` for a rejected bind |
 | `tests/fake_directory.py` | In-memory directory, filter matcher, and the fake connection behind the seam |
 | `tests/test_filters.py` | Filter construction, escaping, and DN validation — the security tests (§7.2, §13) |
@@ -1052,6 +1057,7 @@ offline, without a directory.
 | `tests/test_errors.py` | The translation boundary and the error hierarchy (§6) |
 | `tests/test_fake_directory.py` | The fake's own filter matcher |
 | `tests/test_cli.py` | Argument parsing, rendering, the exit-code map and the JSON encoder — the CLI's pure parts — plus whether each subcommand's `with` block releases its connection |
+| `tests/test_benchmark.py` | The benchmark harness's counting, comparison and probe logic, offline against the fake directory |
 
 ## Appendix B — References
 
