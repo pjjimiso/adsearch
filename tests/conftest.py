@@ -8,6 +8,13 @@ import pytest
 from ldap3 import Connection
 
 from adsearch.config import LDAPConfig
+from adsearch.errors import (
+    LDAPAuthError,
+    LDAPConfigError,
+    LDAPConnectionError,
+    LDAPQueryError,
+    NotFoundError,
+)
 from adsearch.models import DEFAULT_ATTRIBUTES, AttributeMap
 from adsearch.search import LDAPSearch
 
@@ -16,6 +23,18 @@ from tests.fake_directory import Entry, FakeConnection, FakeDirectory, Failure
 
 BASE_DN = "DC=test,DC=com"
 CONFIG = LDAPConfig(server="ldaps://dc.test.com", base_dn=BASE_DN)
+
+# The exit codes DESIGN §6.4 publishes, written out rather than read from
+# `cli._EXIT_CODES`: a test that imports the map under test cannot catch the
+# map being wrong. Shared so the CLI tests and the README's exit-code table
+# check themselves against one list.
+DOCUMENTED_CODES = [
+    (LDAPConfigError, 3),
+    (LDAPAuthError, 4),
+    (LDAPConnectionError, 5),
+    (LDAPQueryError, 6),
+    (NotFoundError, 7),
+]
 
 
 class NullContext:

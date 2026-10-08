@@ -171,7 +171,21 @@ with LDAPSearch(LDAPConfig.from_env()) as ad:
 issuing one query per level (per `batch_size` managers within a level) rather than asking the
 directory to resolve the whole tree in one filter — see
 [ADR-0001](docs/adr/0001-bfs-over-in-chain.md) for the measurements behind that. Full depth is
-opt-in, by choosing the method; both exclude disabled accounts.
+opt-in, by choosing the method.
+
+**Both return disabled accounts.** Excluding them is a `find_users` criterion, and these two
+wrappers take no `include_disabled` parameter, so they have no criterion to opt out of. If you want
+direct reports with disabled accounts dropped, ask for the one-hop search instead, which applies the
+default exclusion:
+
+```python
+from adsearch import LDAPConfig, LDAPSearch
+
+with LDAPSearch(LDAPConfig.from_env()) as ad:
+    manager_dn = ad.resolve_user_dn("jdoe")
+    enabled_only = ad.find_users(manager_dn=manager_dn)       # disabled dropped
+    including_disabled = ad.direct_reports("jdoe")            # disabled returned
+```
 
 ## Group membership
 
@@ -267,10 +281,10 @@ query that rests on a premise that doesn't exist:
 
 | Exception | Raised for |
 |---|---|
-| `LDAPConfigError` | Missing required fields or env vars, a malformed DN, a password without TLS |
+| `LDAPConfigError` | Missing required fields or env vars, or a bind password without TLS |
 | `LDAPAuthError` | The server rejected the bind: bad credentials, locked account, expired password |
 | `LDAPConnectionError` | DNS, TCP connect, TLS handshake, or a timeout reaching the server |
-| `LDAPQueryError` | The server rejected the query: malformed filter, undefined attribute, limit exceeded |
+| `LDAPQueryError` | A rejected query: a malformed filter, DN or attribute name — whether this library rejected it before sending, or the server did — plus a size or time limit exceeded |
 | `NotFoundError` | A resolve step that must return exactly one entry returned zero, or more than one |
 
 Everything `ldap3` raises is translated into one of these at the boundary, so a consumer never has
@@ -351,9 +365,11 @@ adsearch --debug --insecure employee 12345678
 | `--debug` | anywhere | Print the traceback on failure, not just the message |
 | `--insecure` | anywhere | Skip TLS certificate validation. A first-contact debugging escape hatch, never for production |
 
-`--debug` and `--insecure` are accepted on either side of the subcommand. `describe` outputs JSON
-regardless of format flags, since its field set varies per user. Run `adsearch --help`, or
-`adsearch <subcommand> --help`, for the generated list.
+`--debug` and `--insecure` are accepted on either side of the subcommand. `describe`, `resolve-dn`
+and `server-info` take those two and nothing else — the format flags are offered only on the four
+search subcommands, so `adsearch describe --username jdoe --json` is a usage error (exit `2`) rather
+than a flag that gets ignored. `describe` always prints JSON, since its field set varies per user.
+Run `adsearch --help`, or `adsearch <subcommand> --help`, for the generated list.
 
 ## What this library does not do
 
