@@ -44,7 +44,7 @@ from adsearch.errors import (
 )
 from adsearch.search import LDAPSearch
 
-from tests.conftest import ANN, BO, searcher, unbindable
+from tests.conftest import ANN, BO, NullContext, searcher, unbindable
 from tests.fake_directory import Failure, user
 
 
@@ -296,7 +296,7 @@ def test_the_cli_test_subcommand_translates_a_failure_from_who_am_i(
                 def who_am_i() -> str:
                     raise LDAPSocketReceiveError("error receiving data")
 
-    class Bound:
+    class Bound(NullContext):
         def __init__(self, config, *args, **kwargs) -> None:
             self.conn = Unreachable()
 
