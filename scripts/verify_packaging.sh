@@ -27,14 +27,15 @@ Usage:
   scripts/verify_packaging.sh                    Local repo at tag v<version>
   scripts/verify_packaging.sh --ref <git-ref>    A branch, tag or SHA instead
   scripts/verify_packaging.sh --remote           The README's GitHub URL (post-push)
-  scripts/verify_packaging.sh --allow-stale-ref  Permit a ref that is not HEAD
+  scripts/verify_packaging.sh --allow-stale-ref  Permit a ref missing HEAD
 
 Defaults to the local repository, so the documented install path can be
 verified before the tag is pushed. `--remote` is the post-push check.
 
-The ref must resolve to HEAD. A ref pointing elsewhere would install, import
-and type-check a tree unrelated to your working copy and report success, so it
-is refused rather than warned about. `--allow-stale-ref` is for deliberately
+The ref must contain HEAD — equal to it, or a descendant such as the merge
+commit a release tag sits on. A ref that does not would install, import and
+type-check a tree missing what you are sitting on and report success, so it is
+refused rather than warned about. `--allow-stale-ref` is for deliberately
 checking an older release.
 USAGE
 }
@@ -106,13 +107,21 @@ else
     CLONE_URL="file://$(dirname -- "$GIT_COMMON")"
 fi
 
-assert_ref_is_head() {
+assert_ref_contains_head() {
     # The failure this exists to prevent: `$REF` defaults to a version tag, and
     # a tag can point anywhere — at an abandoned branch, or at a release from
     # before the change you are verifying. Steps 1-3 would then install, import
     # and type-check that unrelated tree, pass, and print "all checks passed"
     # about code you never touched.
-    local at head
+    #
+    # Containment rather than equality, because a release tag normally sits on
+    # the *merge* commit, whose SHA differs from the branch HEAD it merged.
+    # Requiring equality refused that — the ordinary case — and sent you to
+    # --allow-stale-ref, a flag meaning the opposite, which is how routinely
+    # passing it becomes the habit that brings the original failure back. A ref
+    # that has HEAD as an ancestor contains everything you are sitting on, so
+    # verifying it is honest; one that does not is refused as before.
+    local at head ahead
     if ! at="$(git -C "$REPO_ROOT" rev-list -n1 "$REF" 2>/dev/null)"; then
         if [[ "$REMOTE" == 1 ]]; then
             echo "  note: $REF does not resolve locally; cannot compare it to HEAD"
@@ -127,19 +136,24 @@ assert_ref_is_head() {
         echo "  ref:     $REF -> $at (= HEAD)"
         return 0
     fi
+    if git -C "$REPO_ROOT" merge-base --is-ancestor "$head" "$at"; then
+        ahead="$(git -C "$REPO_ROOT" rev-list --count "$head..$at")"
+        echo "  ref:     $REF -> $at (contains HEAD, plus $ahead commit(s))"
+        return 0
+    fi
     if [[ "$ALLOW_STALE" == 1 ]]; then
-        echo "  ref:     $REF -> $at (NOT HEAD $head; allowed by --allow-stale-ref)"
+        echo "  ref:     $REF -> $at (does NOT contain HEAD $head; allowed by --allow-stale-ref)"
         return 0
     fi
     cat >&2 <<EOF
 
-refusing to verify a ref that is not HEAD.
+refusing to verify a ref that does not contain HEAD.
 
   $REF resolves to  $at
   HEAD is           $head
 
 Steps 1-3 install and check out whatever '$REF' points at, so this run would
-report on that tree and not on your working copy. Either move the tag to HEAD,
+report on a tree that is missing what you are sitting on. Either move the tag,
 pass --ref with the ref you actually mean, or pass --allow-stale-ref if you
 really are checking an older release.
 EOF
@@ -168,7 +182,7 @@ echo "adsearch $VERSION — packaging verification"
 echo "  source:  git+${CLONE_URL}@${REF}"
 echo "  floor:   Python $FLOOR"
 echo "  workdir: $WORK  (not the repo root: $REPO_ROOT)"
-assert_ref_is_head
+assert_ref_contains_head
 if [[ "$DIRTY" != 0 ]]; then
     printf '\033[1m  warning: %s uncommitted file(s) in %s are NOT covered by this run\033[0m\n' \
         "$DIRTY" "$REPO_ROOT"

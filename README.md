@@ -405,11 +405,12 @@ scripts/verify_packaging.sh --ref my-branch                  # a branch, before 
 scripts/verify_packaging.sh --remote                         # the published GitHub URL
 ```
 
-Every step installs or checks out one git ref, and that ref has to resolve to `HEAD`. A ref pointing
-anywhere else would install, import and type-check a tree unrelated to your working copy and then
-report success, so it is refused rather than warned about — pass `--ref` with the branch you are on
-while the release tag still points elsewhere. Uncommitted files are named in the closing summary,
-since no step can see them.
+Every step installs or checks out one git ref, and that ref has to **contain** `HEAD` — either equal
+to it, or a descendant such as the merge commit a release tag sits on. A ref missing your `HEAD`
+would install, import and type-check a tree without the work you are sitting on and then report
+success, so it is refused rather than warned about; pass `--ref` with the branch you are on while the
+release tag still points elsewhere, or `--allow-stale-ref` to check an older release on purpose.
+Uncommitted files are named in the closing summary, since no step can see them.
 
 The design rationale behind every choice above lives in [docs/DESIGN.md](docs/DESIGN.md), the
 vocabulary in [CONTEXT.md](CONTEXT.md), and the manager-traversal measurements in
