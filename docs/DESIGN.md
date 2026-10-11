@@ -1074,7 +1074,7 @@ offline, without a directory.
 | `src/adsearch/search.py` | Connection lifecycle, the `ldap3` translation boundary (§6.2), paged search core, discovery, resolvers, wrappers |
 | `src/adsearch/cli.py` | argparse, output formatting, exit codes, `getpass`, `basicConfig` |
 | `scripts/benchmark.py` | Benchmark harness: the manager-traversal and group-membership comparisons of ADR-0001, and the filter-complexity probe. Requires a live directory; not packaged in the wheel |
-| `scripts/verify_packaging.sh` | The §11 packaging verification: install from the pinned git URL into a temp directory outside the repo root, type-check the consumer script against that install, and run the suite on the declared Python floor. Refuses a ref that is not `HEAD` |
+| `scripts/verify_packaging.sh` | The §11 packaging verification: install from the pinned git URL into a temp directory outside the repo root, type-check the consumer script against that install, and run the suite on the declared Python floor. Refuses a ref that does not contain `HEAD` |
 | `scripts/consumer_check.py` | The consumer script §11 type-checks: asserts the install came from site-packages with no leaked `src`, and that `py.typed` survived the build. Run and checked only by `verify_packaging.sh`, never by pytest |
 | `tests/conftest.py` | The offline guard — no test opens a socket — the fake-backed `searcher` helpers, and `unbindable` for a rejected bind |
 | `tests/fake_directory.py` | In-memory directory, filter matcher, and the fake connection behind the seam |
